@@ -30,7 +30,7 @@ class OverlayService : Service() {
         private const val TAG = "HoopLandHelper"
     }
 
-    private enum class CalStep { BAR_LEFT, BAR_RIGHT, GREEN_COLOR, SHOOT_BUTTON, DONE }
+    private enum class CalStep { BAR_LEFT, BAR_RIGHT, SHOOT_BUTTON, DONE }
 
     private lateinit var windowManager: WindowManager
     private lateinit var shotManager: ShotManager
@@ -180,7 +180,7 @@ class OverlayService : Service() {
             calStep = CalStep.BAR_LEFT
             barLeft = 0; barTop = 0; barRight = 0; barBottom = 0
             tvInstruction.text = "Tap the LEFT edge of the shooting meter bar"
-            tvStep.text = "1/4"
+            tvStep.text = "1/3"
             tvCoords.text = ""
             crosshair.visibility = View.GONE
             Log.d(TAG, "Calibration reset")
@@ -210,7 +210,7 @@ class OverlayService : Service() {
 
         windowManager.addView(calView, params)
         updateCalInstruction(tvInstruction, tvStep)
-        Log.d(TAG, "Calibration overlay shown — step 1/4: tap bar left edge")
+        Log.d(TAG, "Calibration overlay shown — step 1/3: tap bar left edge")
     }
 
     private fun handleCalTap(x: Int, y: Int) {
@@ -229,29 +229,15 @@ class OverlayService : Service() {
                 barRight = x; barBottom = y + 20
                 val region = BarRegion(barLeft, barTop, barRight, barBottom)
                 repo.saveBarRegion(region)
-                Log.d(TAG, "Cal step 2: BAR_RIGHT tapped at ($x, $y) -> region=(${region.left},${region.top},${region.right},${region.bottom})")
-                calStep = CalStep.GREEN_COLOR
-            }
-            CalStep.GREEN_COLOR -> {
-                val sampledColor = ScreenCaptureService.instance
-                    ?.acquireBarFrame()
-                    ?.let { (_, _, getPixel) ->
-                        val localX = (x - barLeft).coerceAtLeast(0)
-                        val localY = (y - barTop).coerceAtLeast(0)
-                        getPixel(localX, localY)
-                    }
-                    ?: Color.rgb(0, 200, 0)
-                val hsv = FloatArray(3)
-                Color.colorToHSV(sampledColor, hsv)
-                val hsvRange = HsvRange(hue = hsv[0], saturation = hsv[1], value = hsv[2])
-                repo.saveGreenHsv(hsvRange)
-                Log.d(TAG, "Cal step 3: GREEN_COLOR tapped at ($x, $y) -> color=0x${Integer.toHexString(sampledColor)} -> HSV(%.1f, %.2f, %.2f)".format(hsv[0], hsv[1], hsv[2]))
+                // Save default green HSV range (hue 80-160, saturation > 0.3, value > 0.3)
+                repo.saveGreenHsv(HsvRange(hue = 120f, saturation = 0.7f, value = 0.7f))
+                Log.d(TAG, "Cal step 2: BAR_RIGHT tapped at ($x, $y) -> region=(${region.left},${region.top},${region.right},${region.bottom}), green HSV auto-set")
                 calStep = CalStep.SHOOT_BUTTON
             }
             CalStep.SHOOT_BUTTON -> {
                 val pos = ShootPosition(x, y)
                 repo.saveShootPosition(pos)
-                Log.d(TAG, "Cal step 4: SHOOT_BUTTON tapped at ($x, $y)")
+                Log.d(TAG, "Cal step 3: SHOOT_BUTTON tapped at ($x, $y)")
                 calStep = CalStep.DONE
             }
             CalStep.DONE -> {}
@@ -269,11 +255,10 @@ class OverlayService : Service() {
         tvInstruction.text = when (calStep) {
             CalStep.BAR_LEFT    -> "Tap the LEFT edge of the shooting meter bar"
             CalStep.BAR_RIGHT   -> "Tap the RIGHT edge of the shooting meter bar"
-            CalStep.GREEN_COLOR -> "Tap a GREEN pixel in the meter (the perfect zone color)"
             CalStep.SHOOT_BUTTON-> "Tap the SHOOT button in Hoop Land"
             CalStep.DONE        -> "Done! Calibrating..."
         }
-        tvStep.text = "${calStep.ordinal + 1}/4"
+        tvStep.text = "${calStep.ordinal + 1}/3"
     }
 
     private fun exitCalibration() {
