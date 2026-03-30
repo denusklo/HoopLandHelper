@@ -14,6 +14,7 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import com.denusklo.hooplandhelper.data.BarRegion
+import com.denusklo.hooplandhelper.core.BarFrame
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -45,16 +46,29 @@ class ScreenCaptureService(private val context: Context) {
     // Debug PNG saving — separate from content scanning
     private var debugPngSaved = false
 
+    // Frame sequence counter — increments per unique captured frame
+    private var frameSeqCounter: Long = 0
+
+    // Track last-returned timestamp for isDuplicate detection in acquireBarFrame
+    private var lastReturnedTimestampNs: Long = 0L
+
     // Latest frame cached by the image listener
     @Volatile
     private var latestFrame: FrameData? = null
+
+    // Frame deduplication: track last-seen timestamp to skip duplicate frames
+    @Volatile
+    private var lastCapturedTimestampNs: Long = 0L
 
     private data class FrameData(
         val buffer: ByteBuffer,
         val rowStride: Int,
         val pixelStride: Int,
         val bufferCap: Long,
-        val rotation: Int
+        val rotation: Int,
+        val timestampNs: Long,     // Image.timestamp (CLOCK_MONOTONIC nanoseconds)
+        val frameSeq: Long,        // Sequential frame counter
+        val observedNs: Long       // System.nanoTime() when cached
     )
 
     fun start(resultCode: Int, data: android.content.Intent, region: BarRegion) {
@@ -83,6 +97,15 @@ class ScreenCaptureService(private val context: Context) {
         imageReader!!.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
+                val frameTs = image.timestamp  // CLOCK_MONOTONIC nanoseconds
+
+                // Deduplication: skip buffer copy if same frame (display 60Hz, game 30fps)
+                if (frameTs == lastCapturedTimestampNs) {
+                    return@setOnImageAvailableListener
+                }
+                lastCapturedTimestampNs = frameTs
+                frameSeqCounter++
+
                 val plane = image.planes[0]
                 val pixelStride = plane.pixelStride
                 val rowStride = plane.rowStride
@@ -97,7 +120,7 @@ class ScreenCaptureService(private val context: Context) {
                 val rot = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
                     .defaultDisplay.rotation
 
-                latestFrame = FrameData(copy, rowStride, pixelStride, cap, rot)
+                latestFrame = FrameData(copy, rowStride, pixelStride, cap, rot, frameTs, frameSeqCounter, System.nanoTime())
             } catch (e: Exception) {
                 Log.e(TAG, "Frame listener error: ${e.message}")
             } finally {
@@ -126,6 +149,9 @@ class ScreenCaptureService(private val context: Context) {
         captureThread = null
         captureHandler = null
         latestFrame = null
+        lastCapturedTimestampNs = 0L
+        lastReturnedTimestampNs = 0L
+        frameSeqCounter = 0
         instance = null
     }
 
@@ -242,7 +268,7 @@ class ScreenCaptureService(private val context: Context) {
         return bufRow to bufCol
     }
 
-    fun acquireBarFrame(): Triple<Int, Int, (Int, Int) -> Int>? {
+    fun acquireBarFrame(): BarFrame? {
         val region = barRegion ?: return null
         val frame = latestFrame ?: return null
 
@@ -251,20 +277,15 @@ class ScreenCaptureService(private val context: Context) {
         val pixelStride = frame.pixelStride
         val bufferCap = frame.bufferCap.toLong()
 
+        // Dedup: check if this frame was already returned
+        val isDup = (frame.timestampNs == lastReturnedTimestampNs)
+        lastReturnedTimestampNs = frame.timestampNs
+
         // Rescan content bounds if needed (e.g., first landscape frame after portrait overlay check)
         // This is fast (~250ms) and only happens once when transitioning to landscape game.
         if (needsContentRescan()) {
             scanContentBounds(buffer, rowStride, pixelStride, bufferCap)
         }
-
-        // Debug PNG saving disabled to reduce thermal load during gameplay
-        // if (!debugPngSaved) {
-        //     debugPngSaved = true
-        //     val bgBuffer = buffer.duplicate()
-        //     Thread {
-        //         saveDebugPngs(bgBuffer, rowStride, pixelStride, bufferCap)
-        //     }.start()
-        // }
 
         val width = region.right - region.left
         val height = region.bottom - region.top
@@ -272,7 +293,7 @@ class ScreenCaptureService(private val context: Context) {
 
         // Direct buffer reader — no bitmap allocation.
         // GreenZoneDetector only reads midY row (463 pixels instead of 29,169).
-        return Triple(width, height) { x, y ->
+        val getPixel: (Int, Int) -> Int = { x, y ->
             val dx = region.left + x
             val dy = region.top + y
             val (bufRow, bufCol) = displayToBufferCoords(dx, dy)
@@ -287,6 +308,8 @@ class ScreenCaptureService(private val context: Context) {
                 (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
+
+        return BarFrame(width, height, getPixel, frame.timestampNs, isDup, frame.frameSeq, frame.observedNs)
     }
 
     private fun saveDebugPngs(
