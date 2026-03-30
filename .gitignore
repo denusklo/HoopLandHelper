@@ -23,3 +23,5 @@ captures/
 
 # Credentials
 google-services.json
+
+.claude/

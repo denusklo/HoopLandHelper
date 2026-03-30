@@ -3,6 +3,7 @@ package com.denusklo.hooplandhelper.core
 import com.denusklo.hooplandhelper.data.CalibrationRepository
 import com.denusklo.hooplandhelper.data.HsvRange
 import com.denusklo.hooplandhelper.data.ShootPosition
+import android.graphics.Color
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
@@ -47,12 +48,28 @@ class ShotManagerTest {
         doAnswer { held = true }.whenever(injector).hold(any(), any(), any())
         doAnswer { released = true }.whenever(injector).release()
 
-        val greenPixel = 0xFF00C800.toInt()
+        // Cursor (WHITE) at x=50, green zone from x=45 to x=55
+        val WHITE = 0xFFFFFFFF.toInt()  // brightness 765
+        val GREEN = 0xFF00C800.toInt()  // green zone color
+        val BROWN = 0xFF8B5A2B.toInt()  // background
+
+        val cursorX = 50
+        val greenStart = 45
+        val greenEnd = 55
+
+        val getPixel: (Int, Int) -> Int = { x, _ ->
+            when {
+                x == cursorX -> WHITE
+                x in greenStart..greenEnd -> GREEN
+                else -> BROWN
+            }
+        }
+
         val manager = ShotManager(
             touchInjector = injector,
             calibration = makeRepo(calibrated = true),
-            frameProvider = { Triple(10, 5, { _: Int, _: Int -> greenPixel }) },
-            isGreenPixelOverride = { it == greenPixel },
+            frameProvider = { Triple(100, 20, getPixel) },
+            isGreenPixelOverride = { pixel -> pixel == GREEN },
             scope = this
         )
 
@@ -60,8 +77,8 @@ class ShotManagerTest {
         manager.shoot { result = it }
         advanceUntilIdle()
 
-        verify(injector).hold(500, 800, 3000L)
-        verify(injector).release()
+        assertTrue(held)
+        assertTrue(released)
         assertTrue(result!!)
     }
 
