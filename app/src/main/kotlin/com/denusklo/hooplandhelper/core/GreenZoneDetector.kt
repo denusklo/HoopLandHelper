@@ -1,6 +1,7 @@
 package com.denusklo.hooplandhelper.core
 
 import android.graphics.Color
+import android.util.Log
 import com.denusklo.hooplandhelper.data.HsvRange
 
 class GreenZoneDetector(
@@ -10,8 +11,13 @@ class GreenZoneDetector(
 
     fun isGreenZoneAtCursor(width: Int, height: Int, getPixel: (x: Int, y: Int) -> Int): Boolean {
         val cursorX = findCursorX(width, height, getPixel)
-        if (cursorX < 0) return false
-        return isSampleGreen(height, cursorX, getPixel)
+        if (cursorX < 0) {
+            Log.d(TAG, "isGreenZoneAtCursor: no cursor found (width=$width, height=$height)")
+            return false
+        }
+        val result = isSampleGreen(height, cursorX, getPixel)
+        Log.d(TAG, "isGreenZoneAtCursor: cursorX=$cursorX, result=$result")
+        return result
     }
 
     private fun findCursorX(width: Int, height: Int, getPixel: (Int, Int) -> Int): Int {
@@ -38,6 +44,8 @@ class GreenZoneDetector(
         return false
     }
 }
+
+private const val TAG = "HoopLandHelper"
 
 private fun defaultIsGreen(pixel: Int, greenHsv: HsvRange): Boolean {
     val hsv = FloatArray(3)

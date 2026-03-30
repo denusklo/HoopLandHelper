@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/calibration_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#00000000">
+
+    <!-- Instruction bar at top -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="#CC000000"
+        android:orientation="horizontal"
+        android:padding="12dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/tv_cal_instruction"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Tap the LEFT edge of the shooting meter bar"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/tv_cal_step"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1/4"
+            android:textColor="#AAAAAA"
+            android:textSize="14sp"
+            android:layout_marginStart="12dp" />
+
+        <Button
+            android:id="@+id/btn_cal_cancel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Cancel"
+            android:textSize="12sp"
+            android:layout_marginStart="12dp" />
+
+    </LinearLayout>
+
+    <!-- Crosshair dot -->
+    <View
+        android:id="@+id/cal_crosshair"
+        android:layout_width="20dp"
+        android:layout_height="20dp"
+        android:background="#FFFF0000"
+        android:visibility="gone" />
+
+    <!-- Bottom bar with reset -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#CC000000"
+        android:padding="12dp"
+        android:gravity="center">
+
+        <Button
+            android:id="@+id/btn_cal_reset"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Reset"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/tv_cal_coords"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#FFFF00"
+            android:textSize="12sp"
+            android:layout_marginStart="20dp" />
+    </LinearLayout>
+
+</FrameLayout>
