@@ -1,0 +1,25 @@
+# Images
+*.jpeg
+*.jpg
+*.png
+*.gif
+*.webp
+
+# Android build
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# Kotlin
+*.class
+
+# Credentials
+google-services.json
