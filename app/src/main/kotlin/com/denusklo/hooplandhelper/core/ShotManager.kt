@@ -13,6 +13,7 @@ class ShotManager(
     private val isGreenPixelOverride: ((Int) -> Boolean)? = null,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 ) {
+    private var currentJob: Job? = null
     private var isRunning = false
 
     fun shoot(onResult: (Boolean) -> Unit) {
@@ -28,12 +29,12 @@ class ShotManager(
             GreenZoneDetector(greenHsv)
         }
 
-        scope.launch {
+        currentJob = scope.launch {
             touchInjector.hold(shootPos.x, shootPos.y, timeoutMs)
             val deadline = System.currentTimeMillis() + timeoutMs
             var detected = false
 
-            while (System.currentTimeMillis() < deadline) {
+            while (isActive && System.currentTimeMillis() < deadline) {
                 val frame = frameProvider()
                 if (frame != null) {
                     val (w, h, getPixel) = frame
@@ -47,11 +48,12 @@ class ShotManager(
 
             touchInjector.release()
             isRunning = false
-            onResult(detected)
+            if (isActive) onResult(detected)
         }
     }
 
     fun cancel() {
+        currentJob?.cancel()
         if (isRunning) {
             touchInjector.release()
             isRunning = false
