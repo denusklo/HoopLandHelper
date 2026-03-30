@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">HoopLand Helper</string>
+    <string name="accessibility_service_description">HoopLand Helper uses this to simulate touch on non-rooted devices</string>
 </resources>
