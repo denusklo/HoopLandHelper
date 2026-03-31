@@ -101,7 +101,7 @@ class OverlayService : Service() {
 
         val rootChecker = RootChecker()
         val isRooted = rootChecker.isRooted()
-        val relayLatency = if (isRooted) 100L else 250L  // ms: fixed sendevent latency (empirical)
+        val relayLatency = if (isRooted) 100L else 250L  // ms: fixed sendevent latency (instrumentation baseline)
         Log.d(TAG, "Root check: isRooted=$isRooted, latency=${relayLatency}ms")
 
         // ADB relay for non-root touch injection (requires: adb reverse tcp:9999 tcp:9999 + relay.py on host)
@@ -201,7 +201,7 @@ class OverlayService : Service() {
         setButtonColor(Color.YELLOW)
         Log.d(TAG, "AUTO tapped — shooting...")
         shotManager.shoot { success ->
-            Log.d(TAG, "Shot result: ${if (success) "PERFECT" else "MISSED/TIMEOUT"}")
+            Log.d(TAG, "SHOT_COMPLETE: success=$success")
             setButtonColor(if (success) Color.GREEN else Color.RED)
             overlayView?.postDelayed({ setButtonColor(Color.GRAY) }, 500)
         }
@@ -238,7 +238,7 @@ class OverlayService : Service() {
             Log.d(TAG, "Bar rect: no frame available, skipping overlay")
             return
         }
-        val (w, h, getPixel) = frame
+        val (w, h, getPixel) = Triple(frame.width, frame.height, frame.getPixel)
         var totalBrightness = 0
         var samples = 0
         for (y in 0 until h step (h / 3).coerceAtLeast(1)) {
