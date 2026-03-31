@@ -11,25 +11,117 @@
         android:layout_gravity="top|center_horizontal"
         android:gravity="center"
         android:padding="24dp"
-        android:text="Tap the LEFT edge of the shooting meter bar"
+        android:text="Tap point 1 of 4 on the shooting bar"
         android:textColor="#FFFFFF"
         android:textSize="18sp" />
 
+    <!-- Rectangle preview overlay -->
     <View
-        android:id="@+id/crosshair"
-        android:layout_width="20dp"
-        android:layout_height="20dp"
-        android:background="#FFFF0000"
+        android:id="@+id/rect_preview"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#4400FF00"
         android:visibility="gone" />
 
-    <Button
-        android:id="@+id/btn_reset"
-        android:layout_width="wrap_content"
+    <View
+        android:id="@+id/rect_border"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="@drawable/rect_border"
+        android:visibility="gone" />
+
+    <!-- Crosshair markers -->
+    <TextView
+        android:id="@+id/marker_1"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="1"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/marker_2"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="2"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/marker_3"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="3"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/marker_4"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="4"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <!-- Action buttons at bottom -->
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom|center_horizontal"
-        android:layout_marginBottom="32dp"
-        android:backgroundTint="#FF444444"
-        android:text="Reset Calibration"
-        android:textColor="#FFFFFF" />
+        android:layout_gravity="bottom"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:padding="16dp">
+
+        <Button
+            android:id="@+id/btn_reset"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:backgroundTint="#FF444444"
+            android:text="Reset"
+            android:textColor="#FFFFFF" />
+
+        <Button
+            android:id="@+id/btn_undo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#FF444444"
+            android:text="Undo"
+            android:textColor="#FFFFFF"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btn_confirm"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#FF006600"
+            android:text="Confirm"
+            android:textColor="#FFFFFF"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btn_redo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#FF444444"
+            android:text="Redo"
+            android:textColor="#FFFFFF"
+            android:visibility="gone" />
+
+    </LinearLayout>
 
 </FrameLayout>

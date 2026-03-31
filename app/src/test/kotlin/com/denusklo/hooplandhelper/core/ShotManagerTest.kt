@@ -3,7 +3,6 @@ package com.denusklo.hooplandhelper.core
 import com.denusklo.hooplandhelper.data.CalibrationRepository
 import com.denusklo.hooplandhelper.data.HsvRange
 import com.denusklo.hooplandhelper.data.ShootPosition
-import android.graphics.Color
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
@@ -41,34 +40,43 @@ class ShotManagerTest {
     }
 
     @Test
-    fun `shoot holds then releases and returns true when green detected`() = runTest {
+    fun `shoot holds then releases and returns true with predictive release`() = runTest {
         var held = false
         var released = false
         val injector = mock<TouchInjector>()
         doAnswer { held = true }.whenever(injector).hold(any(), any(), any())
         doAnswer { released = true }.whenever(injector).release()
 
-        // Cursor (WHITE) at x=50, green zone from x=45 to x=55
-        val WHITE = 0xFFFFFFFF.toInt()  // brightness 765
-        val GREEN = 0xFF00C800.toInt()  // green zone color
-        val BROWN = 0xFF8B5A2B.toInt()  // background
+        // Simulate a bar where:
+        // - Green zone is at x=45..55 (dark green)
+        // - Cursor starts at x=10 on frame 1, moves to x=20 on frame 2
+        // - Cursor is WHITE, green zone is GREEN, rest is BLACK
+        val WHITE = 0xFFFFFFFF.toInt()
+        val GREEN = 0xFF00C800.toInt()
+        val BLACK = 0xFF000000.toInt()
 
-        val cursorX = 50
-        val greenStart = 45
-        val greenEnd = 55
+        var frameIndex = 0
+        val cursorPositions = listOf(10, 20)  // cursor moves 10px per frame
 
-        val getPixel: (Int, Int) -> Int = { x, _ ->
-            when {
-                x == cursorX -> WHITE
-                x in greenStart..greenEnd -> GREEN
-                else -> BROWN
+        val frameProvider: FrameProvider = {
+            val cursorX = if (frameIndex < cursorPositions.size) cursorPositions[frameIndex] else cursorPositions.last()
+            frameIndex++
+            val getPixel: (Int, Int) -> Int = { x, _ ->
+                when {
+                    x == cursorX -> WHITE
+                    x in 45..55 -> GREEN
+                    else -> BLACK
+                }
             }
+            Triple(100, 20, getPixel)
         }
 
         val manager = ShotManager(
             touchInjector = injector,
             calibration = makeRepo(calibrated = true),
-            frameProvider = { Triple(100, 20, getPixel) },
+            frameProvider = frameProvider,
+            timeoutMs = 500L,
+            relayLatencyMs = 0L,  // zero latency for test
             isGreenPixelOverride = { pixel -> pixel == GREEN },
             scope = this
         )
@@ -83,7 +91,7 @@ class ShotManagerTest {
     }
 
     @Test
-    fun `shoot returns false on timeout when no green detected`() = runTest {
+    fun `shoot returns false on timeout when no cursor appears`() = runTest {
         val manager = ShotManager(
             touchInjector = mock(),
             calibration = makeRepo(calibrated = true),

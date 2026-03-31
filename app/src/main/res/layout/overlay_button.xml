@@ -23,4 +23,15 @@
         android:src="@android:drawable/ic_menu_manage"
         android:tint="#CCCCCC" />
 
+    <!-- Toggle rectangle visibility -->
+    <ImageView
+        android:id="@+id/btn_toggle_rect"
+        android:layout_width="16dp"
+        android:layout_height="16dp"
+        android:layout_gravity="bottom|end"
+        android:src="@android:drawable/ic_menu_view"
+        android:tint="#CCCCCC"
+        android:background="#4D000000"
+        android:padding="2dp" />
+
 </FrameLayout>

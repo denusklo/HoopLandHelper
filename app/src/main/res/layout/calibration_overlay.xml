@@ -20,7 +20,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Tap the LEFT edge of the shooting meter bar"
+            android:text="Tap point 1 of 4 on the shooting bar"
             android:textColor="#FFFFFF"
             android:textSize="16sp" />
 
@@ -28,10 +28,19 @@
             android:id="@+id/tv_cal_step"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="1/3"
+            android:text="0/4"
             android:textColor="#AAAAAA"
             android:textSize="14sp"
             android:layout_marginStart="12dp" />
+
+        <Button
+            android:id="@+id/btn_cal_undo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Undo"
+            android:textSize="12sp"
+            android:layout_marginStart="8dp"
+            android:visibility="gone" />
 
         <Button
             android:id="@+id/btn_cal_cancel"
@@ -39,26 +48,80 @@
             android:layout_height="wrap_content"
             android:text="Cancel"
             android:textSize="12sp"
-            android:layout_marginStart="12dp" />
+            android:layout_marginStart="8dp" />
 
     </LinearLayout>
 
-    <!-- Crosshair dot -->
+    <!-- Rectangle preview overlay (semi-transparent green) -->
     <View
-        android:id="@+id/cal_crosshair"
-        android:layout_width="20dp"
-        android:layout_height="20dp"
-        android:background="#FFFF0000"
+        android:id="@+id/cal_rect_preview"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#4400FF00"
         android:visibility="gone" />
 
-    <!-- Bottom bar with reset -->
+    <!-- Rectangle border overlay -->
+    <View
+        android:id="@+id/cal_rect_border"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="@drawable/rect_border"
+        android:visibility="gone" />
+
+    <!-- Crosshair markers (1-4) -->
+    <TextView
+        android:id="@+id/cal_marker_1"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="1"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/cal_marker_2"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="2"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/cal_marker_3"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="3"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/cal_marker_4"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:background="@drawable/cal_marker"
+        android:text="4"
+        android:textColor="#FFFF0000"
+        android:textSize="9sp"
+        android:gravity="center"
+        android:visibility="gone" />
+
+    <!-- Bottom bar with reset, coords, confirm/redo -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
         android:background="#CC000000"
         android:padding="12dp"
-        android:gravity="center">
+        android:gravity="center"
+        android:orientation="horizontal">
 
         <Button
             android:id="@+id/btn_cal_reset"
@@ -69,12 +132,31 @@
 
         <TextView
             android:id="@+id/tv_cal_coords"
-            android:layout_width="wrap_content"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
+            android:layout_weight="1"
             android:text=""
             android:textColor="#FFFF00"
             android:textSize="12sp"
-            android:layout_marginStart="20dp" />
+            android:layout_marginStart="12dp" />
+
+        <Button
+            android:id="@+id/btn_cal_confirm"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Confirm"
+            android:textSize="12sp"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btn_cal_redo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Redo"
+            android:textSize="12sp"
+            android:layout_marginStart="8dp"
+            android:visibility="gone" />
+
     </LinearLayout>
 
 </FrameLayout>
