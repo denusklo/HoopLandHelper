@@ -4,6 +4,13 @@ import android.util.Log
 import com.denusklo.hooplandhelper.utils.RootChecker
 import java.io.OutputStream
 
+/** Timing data from a release() call for instrumentation. */
+data class ReleaseStamp(
+    val sendIntentNs: Long,      // System.nanoTime() right before send
+    val sendFlushDoneNs: Long,   // System.nanoTime() right after flush
+    val path: String             // "sendevent" | "swipe" | "adb" | "accessibility"
+)
+
 class TouchInjector(
     private val rootChecker: RootChecker,
     private val serviceProvider: () -> IHoopService?,
@@ -71,17 +78,29 @@ class TouchInjector(
         }
     }
 
-    fun release() {
+    fun release(): ReleaseStamp {
         val rooted = rootedCached ?: rootChecker.isRooted()
         Log.d(TAG, "release() — rooted=$rooted, sendevent=$useSendevent, pos=($holdX,$holdY)")
 
+        val intentNs = System.nanoTime()
+        val path: String
+        val flushDoneNs: Long
+
         if (rooted) {
-            releaseViaRoot()
+            val (p, f) = releaseViaRoot()
+            path = p
+            flushDoneNs = f
         } else if (adbRelay?.isConnected() == true) {
             adbRelay.sendRelease(holdX, holdY)
+            path = "adb"
+            flushDoneNs = System.nanoTime()
         } else {
             serviceProvider()?.cancelHoldGesture()
+            path = "accessibility"
+            flushDoneNs = System.nanoTime()
         }
+
+        return ReleaseStamp(intentNs, flushDoneNs, path)
     }
 
     /** Try connecting relay if not already connected. Returns true if relay is usable. */
@@ -227,17 +246,34 @@ class TouchInjector(
         rootExec("sendevent $device 0 0 0")    // SYN_REPORT
     }
 
-    private fun releaseViaRoot() {
+    /** Returns (path, flushDoneNs) for release via root shell. */
+    private fun releaseViaRoot(): Pair<String, Long> {
         if (useSendevent) {
             val device = touchDevicePath!!
-            rootExec("sendevent $device 3 57 -1; sendevent $device 1 330 0; sendevent $device 0 0 0")
+            val cmd = "sendevent $device 3 57 -1; sendevent $device 1 330 0; sendevent $device 0 0 0"
+            val flushNs = rootExecTimed(cmd)
             Log.d(TAG, "sendevent release")
+            return "sendevent" to flushNs
         } else {
             swipeProcess?.destroy()
             swipeProcess = null
             val cmd = "input swipe $holdX $holdY $holdX $holdY 1"
             Log.d(TAG, "Root release (fallback): $cmd")
             rootExec(cmd)
+            return "swipe" to System.nanoTime()
+        }
+    }
+
+    /** Execute a command via the persistent root shell. Returns flush-complete timestamp. */
+    private fun rootExecTimed(cmd: String): Long {
+        try {
+            val writer = rootShellWriter ?: return System.nanoTime()
+            writer.write("$cmd\n".toByteArray())
+            writer.flush()
+            return System.nanoTime()
+        } catch (e: Exception) {
+            Log.e(TAG, "rootExec failed: ${e.message}")
+            return System.nanoTime()
         }
     }
 
