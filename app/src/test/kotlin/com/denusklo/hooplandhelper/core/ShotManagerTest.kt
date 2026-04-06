@@ -68,7 +68,7 @@ class ShotManagerTest {
                     else -> BLACK
                 }
             }
-            Triple(100, 20, getPixel)
+            BarFrame(100, 20, getPixel, timestampNs = frameIndex * 33_333_333L, isDuplicate = false)
         }
 
         val manager = ShotManager(
@@ -76,7 +76,7 @@ class ShotManagerTest {
             calibration = makeRepo(calibrated = true),
             frameProvider = frameProvider,
             timeoutMs = 500L,
-            relayLatencyMs = 0L,  // zero latency for test
+            initialLatencyMs = 0L,  // zero latency for test
             isGreenPixelOverride = { pixel -> pixel == GREEN },
             scope = this
         )
@@ -95,7 +95,10 @@ class ShotManagerTest {
         val manager = ShotManager(
             touchInjector = mock(),
             calibration = makeRepo(calibrated = true),
-            frameProvider = { Triple(10, 5, { _: Int, _: Int -> 0xFF000000.toInt() }) },
+            frameProvider = {
+                BarFrame(10, 5, { _: Int, _: Int -> 0xFF000000.toInt() },
+                    timestampNs = System.nanoTime(), isDuplicate = false)
+            },
             timeoutMs = 50L,
             scope = this
         )
