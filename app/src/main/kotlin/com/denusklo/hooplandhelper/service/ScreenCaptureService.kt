@@ -78,7 +78,7 @@ class ScreenCaptureService(private val context: Context) {
         captureThread = HandlerThread("ScreenCapture").also { it.start() }
         captureHandler = Handler(captureThread!!.looper)
 
-        imageReader = ImageReader.newInstance(naturalWidth, naturalHeight, PixelFormat.RGBA_8888, 5)
+        imageReader = ImageReader.newInstance(naturalWidth, naturalHeight, PixelFormat.RGBA_8888, 3)
 
         imageReader!!.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -257,14 +257,14 @@ class ScreenCaptureService(private val context: Context) {
             scanContentBounds(buffer, rowStride, pixelStride, bufferCap)
         }
 
-        // Save debug PNGs in background to avoid blocking the shot loop (~1.6s)
-        if (!debugPngSaved) {
-            debugPngSaved = true
-            val bgBuffer = buffer.duplicate()
-            Thread {
-                saveDebugPngs(bgBuffer, rowStride, pixelStride, bufferCap)
-            }.start()
-        }
+        // Debug PNG saving disabled to reduce thermal load during gameplay
+        // if (!debugPngSaved) {
+        //     debugPngSaved = true
+        //     val bgBuffer = buffer.duplicate()
+        //     Thread {
+        //         saveDebugPngs(bgBuffer, rowStride, pixelStride, bufferCap)
+        //     }.start()
+        // }
 
         val width = region.right - region.left
         val height = region.bottom - region.top
