@@ -101,7 +101,7 @@ class OverlayService : Service() {
 
         val rootChecker = RootChecker()
         val isRooted = rootChecker.isRooted()
-        val relayLatency = if (isRooted) 85L else 250L  // ms: sendevent latency (~60ms) + processing overhead (~25ms)
+        val relayLatency = if (isRooted) 100L else 250L  // ms: fixed sendevent latency (empirical)
         Log.d(TAG, "Root check: isRooted=$isRooted, latency=${relayLatency}ms")
 
         // ADB relay for non-root touch injection (requires: adb reverse tcp:9999 tcp:9999 + relay.py on host)
@@ -130,7 +130,7 @@ class OverlayService : Service() {
             touchInjector = injector,
             calibration = calibration,
             frameProvider = { screenCapture.acquireBarFrame() },
-            releaseLatencyMs = relayLatency,
+            initialLatencyMs = relayLatency,
             debugDir = getExternalFilesDir(null)?.absolutePath
         )
         Log.d(TAG, "ShotManager initialized, calibrated=${calibration.isCalibrated()}")
