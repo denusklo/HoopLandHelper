@@ -192,31 +192,36 @@ class ScreenCaptureService(private val context: Context) {
 
         Log.d(TAG, "Content bounds: rows $firstNonBlack..$lastNonBlack (height=$contentHeight) in ${naturalWidth}x${naturalHeight} portrait buffer")
 
-        // Save content strip PNG only on first-ever scan
+        // Save content strip PNG in background (slow, don't block shot loop)
         if (!debugPngSaved && firstNonBlack >= 0 && contentHeight > 0 && contentHeight < naturalHeight) {
-            try {
-                val dir = File(context.getExternalFilesDir(null), "debug")
-                if (!dir.exists()) dir.mkdirs()
-                val bmp = Bitmap.createBitmap(naturalWidth, contentHeight, Bitmap.Config.ARGB_8888)
-                for (row in 0 until contentHeight) {
-                    for (col in 0 until naturalWidth) {
-                        val offset = (firstNonBlack + row).toLong() * rowStride + col.toLong() * pixelStride
-                        if (offset + 3 >= bufferCap) continue
-                        buffer.position(offset.toInt())
-                        val r = buffer.get().toInt() and 0xFF
-                        val g = buffer.get().toInt() and 0xFF
-                        val b = buffer.get().toInt() and 0xFF
-                        bmp.setPixel(col, row, android.graphics.Color.rgb(r, g, b))
+            val bgBuffer = buffer.duplicate()
+            val fnb = firstNonBlack
+            val ch = contentHeight
+            Thread {
+                try {
+                    val dir = File(context.getExternalFilesDir(null), "debug")
+                    if (!dir.exists()) dir.mkdirs()
+                    val bmp = Bitmap.createBitmap(naturalWidth, ch, Bitmap.Config.ARGB_8888)
+                    for (row in 0 until ch) {
+                        for (col in 0 until naturalWidth) {
+                            val offset = (fnb + row).toLong() * rowStride + col.toLong() * pixelStride
+                            if (offset + 3 >= bufferCap) continue
+                            bgBuffer.position(offset.toInt())
+                            val r = bgBuffer.get().toInt() and 0xFF
+                            val g = bgBuffer.get().toInt() and 0xFF
+                            val b = bgBuffer.get().toInt() and 0xFF
+                            bmp.setPixel(col, row, android.graphics.Color.rgb(r, g, b))
+                        }
                     }
+                    val file = File(dir, "content_strip.png")
+                    file.outputStream().use { fos ->
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                    }
+                    Log.d(TAG, "Saved content strip: ${file.absolutePath} (${naturalWidth}x${ch})")
+                } catch (e: Exception) {
+                    Log.e(TAG, "save content strip failed: ${e.message}")
                 }
-                val file = File(dir, "content_strip.png")
-                file.outputStream().use { fos ->
-                    bmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
-                }
-                Log.d(TAG, "Saved content strip: ${file.absolutePath} (${naturalWidth}x${contentHeight})")
-            } catch (e: Exception) {
-                Log.e(TAG, "save content strip failed: ${e.message}")
-            }
+            }.start()
         }
     }
 
@@ -252,33 +257,36 @@ class ScreenCaptureService(private val context: Context) {
             scanContentBounds(buffer, rowStride, pixelStride, bufferCap)
         }
 
-        // Save debug PNGs only once ever (slow ~1s, skip during shots)
+        // Save debug PNGs in background to avoid blocking the shot loop (~1.6s)
         if (!debugPngSaved) {
-            saveDebugPngs(buffer, rowStride, pixelStride, bufferCap)
             debugPngSaved = true
+            val bgBuffer = buffer.duplicate()
+            Thread {
+                saveDebugPngs(bgBuffer, rowStride, pixelStride, bufferCap)
+            }.start()
         }
 
         val width = region.right - region.left
         val height = region.bottom - region.top
         if (width <= 0 || height <= 0) return null
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
-        for (y in 0 until height) {
-            for (x in 0 until width) {
-                val dx = region.left + x
-                val dy = region.top + y
-                val (bufRow, bufCol) = displayToBufferCoords(dx, dy)
-                val offset = bufRow.toLong() * rowStride + bufCol.toLong() * pixelStride
-                if (offset < 0 || offset + 3 >= bufferCap) continue
+        // Direct buffer reader — no bitmap allocation.
+        // GreenZoneDetector only reads midY row (463 pixels instead of 29,169).
+        return Triple(width, height) { x, y ->
+            val dx = region.left + x
+            val dy = region.top + y
+            val (bufRow, bufCol) = displayToBufferCoords(dx, dy)
+            val offset = bufRow.toLong() * rowStride + bufCol.toLong() * pixelStride
+            if (offset < 0 || offset + 3 >= bufferCap) {
+                0
+            } else {
                 buffer.position(offset.toInt())
                 val r = buffer.get().toInt() and 0xFF
                 val g = buffer.get().toInt() and 0xFF
                 val b = buffer.get().toInt() and 0xFF
-                bitmap.setPixel(x, y, android.graphics.Color.rgb(r, g, b))
+                (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
-
-        return Triple(width, height, bitmap::getPixel)
     }
 
     private fun saveDebugPngs(
