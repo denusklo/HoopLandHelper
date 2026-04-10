@@ -9,6 +9,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.IBinder
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.*
 import android.widget.Button
@@ -98,18 +99,38 @@ class OverlayService : Service() {
         val prefs = getSharedPreferences("calibration", Context.MODE_PRIVATE)
         val calibration = CalibrationRepository(prefs)
 
+        val rootChecker = RootChecker()
+        val isRooted = rootChecker.isRooted()
+        val relayLatency = if (isRooted) 85L else 250L  // ms: sendevent latency (~60ms) + processing overhead (~25ms)
+        Log.d(TAG, "Root check: isRooted=$isRooted, latency=${relayLatency}ms")
+
         // ADB relay for non-root touch injection (requires: adb reverse tcp:9999 tcp:9999 + relay.py on host)
         val relay = AdbRelayClient()
 
+        // Display info for sendevent coordinate mapping
+        val realMetrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        val display = (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay
+        display.getRealMetrics(realMetrics)
+        val nW = minOf(realMetrics.widthPixels, realMetrics.heightPixels)
+        val nH = maxOf(realMetrics.widthPixels, realMetrics.heightPixels)
+
         val injector = TouchInjector(
-            rootChecker = RootChecker(),
+            rootChecker = rootChecker,
             serviceProvider = { HoopAccessibilityService.instance },
-            adbRelay = relay
+            adbRelay = relay,
+            naturalWidth = nW,
+            naturalHeight = nH,
+            rotationProvider = {
+                @Suppress("DEPRECATION")
+                (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.rotation
+            }
         )
         shotManager = ShotManager(
             touchInjector = injector,
             calibration = calibration,
             frameProvider = { screenCapture.acquireBarFrame() },
+            releaseLatencyMs = relayLatency,
             debugDir = getExternalFilesDir(null)?.absolutePath
         )
         Log.d(TAG, "ShotManager initialized, calibrated=${calibration.isCalibrated()}")
