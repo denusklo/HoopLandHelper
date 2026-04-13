@@ -11,7 +11,6 @@ class GreenZoneDetector(
 ) {
 
     private var frameDumpCount = 0
-    private val MAX_DEBUG_FRAMES = 10
 
     /**
      * Result of analyzing a single bar frame.
@@ -28,6 +27,15 @@ class GreenZoneDetector(
         val greenWidth: Int get() = greenRight - greenLeft
         val hasGreenZone: Boolean get() = greenLeft >= 0 && greenRight > greenLeft
         val hasCursor: Boolean get() = cursorX >= 0
+
+        /**
+         * Get the target X position within the green zone (default: 70% for margin).
+         * This is where we want the cursor to be when we release.
+         */
+        fun getTargetX(greenZoneProgress: Float = 0.7f): Int {
+            if (!hasGreenZone) return -1
+            return greenLeft + (greenWidth * greenZoneProgress).toInt()
+        }
     }
 
     /**
@@ -39,9 +47,9 @@ class GreenZoneDetector(
     fun analyzeBar(width: Int, height: Int, getPixel: (Int, Int) -> Int): BarAnalysis {
         val midY = height / 2
 
-        // Dump first few frames for debugging
-        if (frameDumpCount < 3) {
-            dumpFrame(width, height, getPixel, frameDumpCount)
+        // Save first frame as debug PNG only
+        if (frameDumpCount < 1 && debugDir != null) {
+            saveDebugPng(width, height, getPixel, frameDumpCount)
             frameDumpCount++
         }
 
@@ -50,8 +58,6 @@ class GreenZoneDetector(
         var cursorX = -1
 
         // Track green pixels to find the green zone
-        var greenStart = -1
-        var greenEnd = -1
         var inGreen = false
         var currentGreenStart = -1
 
@@ -98,24 +104,17 @@ class GreenZoneDetector(
             if (gw > bestGreenWidth) {
                 bestGreenStart = currentGreenStart
                 bestGreenEnd = width - 1
-                bestGreenWidth = gw
             }
         }
 
         // Cursor threshold
         if (maxBrightness <= 600) cursorX = -1
 
-        val analysis = BarAnalysis(
+        return BarAnalysis(
             cursorX = cursorX,
             greenLeft = bestGreenStart,
             greenRight = bestGreenEnd
         )
-
-        if (frameDumpCount <= 5) {
-            Log.d(TAG, "analyzeBar: cursorX=${analysis.cursorX} (maxBr=$maxBrightness), greenZone=${analysis.greenLeft}..${analysis.greenRight} (width=${analysis.greenWidth})")
-        }
-
-        return analysis
     }
 
     /**
@@ -135,45 +134,18 @@ class GreenZoneDetector(
     }
 
     /**
-     * Calculate the time in ms from the first frame to when cursor reaches green zone center.
+     * Calculate the time in ms from the first frame to when cursor reaches the target position in green zone.
      * @param first First frame analysis (cursor + green zone)
      * @param second Second frame analysis (for cursor speed measurement)
      * @param intervalMs Time between the two frames
-     * @return Time in ms until cursor reaches green zone center, or -1 if invalid
+     * @param greenZoneProgress Target position in green zone (0.0 = left edge, 0.5 = center, 0.7 = 70%, 1.0 = right edge)
+     * @return Time in ms until cursor reaches target position, or -1 if invalid
      */
     fun calculateTimeToGreenMs(
         first: BarAnalysis,
         second: BarAnalysis,
-        intervalMs: Long
-    ): Long {
-        if (!first.hasGreenZone || !first.hasCursor || !second.hasCursor) return -1
-
-        // Cursor speed in pixels per ms
-        val dx = second.cursorX - first.cursorX
-        if (dx <= 0) return -1  // cursor should be moving right
-        val speed = dx.toFloat() / intervalMs.toFloat()
-
-        // Distance from first cursor position to green zone center
-        val distance = first.greenCenter - first.cursorX
-        if (distance <= 0) return 0  // already at or past green zone
-
-        // Time to reach green center
-        return (distance / speed).toLong()
-    }
-
-    /**
-     * Calculate the delay in ms before releasing, based on two analyses.
-     * @param first First frame analysis (cursor + green zone)
-     * @param second Second frame analysis (for cursor speed measurement)
-     * @param intervalMs Time between the two frames
-     * @param relayLatencyMs Expected ADB relay latency to compensate for
-     * @return Delay in ms before release, or 0 if should release immediately, or -1 if invalid
-     */
-    fun calculateReleaseDelayMs(
-        first: BarAnalysis,
-        second: BarAnalysis,
         intervalMs: Long,
-        relayLatencyMs: Long = 120L
+        greenZoneProgress: Float = 0.7f
     ): Long {
         if (!first.hasGreenZone || !first.hasCursor || !second.hasCursor) return -1
 
@@ -182,39 +154,24 @@ class GreenZoneDetector(
         if (dx <= 0) return -1  // cursor should be moving right
         val speed = dx.toFloat() / intervalMs.toFloat()
 
-        // Distance from first cursor position to green zone center
-        val distance = first.greenCenter - first.cursorX
-        if (distance <= 0) return 0  // already at or past green zone
+        // Target position (e.g., 70% into the green zone for margin)
+        val targetX = first.getTargetX(greenZoneProgress)
 
-        // Time to reach green center
-        val timeToGreen = (distance / speed).toLong()
+        // Distance from first cursor position to target
+        val distance = targetX - first.cursorX
+        if (distance <= 0) return 0  // already at or past target
 
-        // Subtract relay latency to release early
-        val releaseDelay = timeToGreen - relayLatencyMs
-
-        Log.d(TAG, "calculateReleaseDelay: speed=${String.format("%.3f", speed)} px/ms, distance=$distance px, timeToGreen=${timeToGreen}ms, relayLatency=${relayLatencyMs}ms, releaseDelay=${releaseDelay}ms")
-
-        return releaseDelay.coerceAtLeast(0)
+        // Time to reach target
+        return (distance / speed).toLong()
     }
 
     /**
      * Legacy method — kept for backwards compatibility with tests.
      */
     fun isGreenZoneAtCursor(width: Int, height: Int, getPixel: (Int, Int) -> Int): Boolean {
-        if (frameDumpCount < 3) {
-            dumpFrame(width, height, getPixel, frameDumpCount)
-            frameDumpCount++
-        }
         val cursorX = findCursorX(width, height, getPixel)
-        if (cursorX < 0) {
-            Log.d(TAG, "isGreenZoneAtCursor: no cursor found (width=$width, height=$height)")
-            return false
-        }
-        val result = isSampleGreen(height, cursorX, getPixel)
-        if (frameDumpCount <= 5) {
-            Log.d(TAG, "isGreenZoneAtCursor: cursorX=$cursorX, result=$result")
-        }
-        return result
+        if (cursorX < 0) return false
+        return isSampleGreen(height, cursorX, getPixel)
     }
 
     private fun findCursorX(width: Int, height: Int, getPixel: (Int, Int) -> Int): Int {
@@ -229,9 +186,6 @@ class GreenZoneDetector(
                 cursorX = x
             }
         }
-        if (frameDumpCount < MAX_DEBUG_FRAMES) {
-            Log.d(TAG, "findCursorX: width=$width, maxBrightness=$maxBrightness at x=$cursorX (threshold=600)")
-        }
         return if (maxBrightness > 600) cursorX else -1
     }
 
@@ -241,79 +195,55 @@ class GreenZoneDetector(
         for (dx in -5..5) {
             val x = (cursorX + dx).coerceAtLeast(0)
             val pixel = getPixel(x, midY)
-            val green = isGreenPixel(pixel)
-            if (green) foundGreen = true
-            if (frameDumpCount < MAX_DEBUG_FRAMES && dx % 2 == 0) {
-                val r = (pixel shr 16) and 0xFF
-                val g = (pixel shr 8) and 0xFF
-                val b = pixel and 0xFF
-                val hsv = FloatArray(3)
-                android.graphics.Color.colorToHSV(pixel, hsv)
-                Log.d(TAG, "  cursorX+${dx}: ARGB=($r,$g,$b) HSV=(${String.format("%.0f",hsv[0])},${String.format("%.2f",hsv[1])},${String.format("%.2f",hsv[2])}) green=$green")
-            }
+            if (isGreenPixel(pixel)) foundGreen = true
         }
         return foundGreen
     }
 
-    /** Dump frame for debugging — saves PNG and logs pixel values */
-    private fun dumpFrame(width: Int, height: Int, getPixel: (Int, Int) -> Int, index: Int) {
+    /** Save frame as debug PNG — no text dump to keep logs clean */
+    private fun saveDebugPng(width: Int, height: Int, getPixel: (Int, Int) -> Int, index: Int) {
         try {
-            if (debugDir != null) {
-                val dir = java.io.File(debugDir)
-                if (!dir.exists()) dir.mkdirs()
-                val file = java.io.File(dir, "bar_frame_${String.format("%02d", index)}.png")
-                val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
-                for (x in 0 until width) {
-                    for (y in 0 until height) {
-                        bitmap.setPixel(x, y, getPixel(x, y))
-                    }
-                }
-                file.outputStream().use { fos ->
-                    bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
-                }
-                Log.d(TAG, "Frame #$index saved to ${file.absolutePath} (${width}x${height})")
-            }
-
-            val midY = height / 2
-            val sb = StringBuilder()
-            var maxBr = 0
-            var maxBrX = -1
+            val dir = java.io.File(debugDir!!)
+            if (!dir.exists()) dir.mkdirs()
+            val file = java.io.File(dir, "bar_frame_${String.format("%02d", index)}.png")
+            val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
             for (x in 0 until width) {
-                val p = getPixel(x, midY)
-                val r = (p shr 16) and 0xFF
-                val g = (p shr 8) and 0xFF
-                val b = p and 0xFF
-                val brightness = r + g + b
-                if (brightness > maxBr) { maxBr = brightness; maxBrX = x }
-                if (x % (width / 20).coerceAtLeast(1) == 0) {
-                    sb.append("[$x:#%02X%02X%02X=$brightness]".format(r, g, b))
+                for (y in 0 until height) {
+                    bitmap.setPixel(x, y, getPixel(x, y))
                 }
             }
-            Log.d(TAG, "Frame #$index (${width}x${height}) mid-row: $sb")
-            Log.d(TAG, "Frame #$index max brightness=$maxBr at x=$maxBrX (threshold=600)")
-
-            if (index == 0) {
-                val colorSb = StringBuilder()
-                colorSb.append("\n  Full mid-row colors:")
-                for (x in 0 until width step (width / 30).coerceAtLeast(1)) {
-                    val p = getPixel(x, midY)
-                    val r = (p shr 16) and 0xFF
-                    val g = (p shr 8) and 0xFF
-                    val b = p and 0xFF
-                    val brightness = r + g + b
-                    val hsv = FloatArray(3)
-                    android.graphics.Color.colorToHSV(p, hsv)
-                    colorSb.append("\n    x=$x: RGB=($r,$g,$b) brightness=$brightness HSV=(${String.format("%.0f",hsv[0])},${String.format("%.2f",hsv[1])},${String.format("%.2f",hsv[2])})")
-                }
-                Log.d(TAG, "Frame #$index full mid-row:$colorSb")
+            file.outputStream().use { fos ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
             }
+            Log.d(TAG, "Debug frame saved: bar_frame_${String.format("%02d", index)}.png (${width}x${height})")
         } catch (e: Exception) {
-            Log.e(TAG, "dumpFrame failed: ${e.message}")
+            Log.e(TAG, "saveDebugPng failed: ${e.message}")
         }
     }
 
     fun resetDebug() {
         frameDumpCount = 0
+    }
+    fun saveReleaseFrame(width: Int, height: Int, getPixel: (Int, Int) -> Int, cursorX: Int, targetX: Int) {
+        if (debugDir == null) return
+        try {
+            val dir = java.io.File(debugDir)
+            if (!dir.exists()) dir.mkdirs()
+            val ts = System.currentTimeMillis() % 100000
+            val file = java.io.File(dir, "release_$ts.png")
+            val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+            for (x in 0 until width) {
+                for (y in 0 until height) {
+                    bitmap.setPixel(x, y, getPixel(x, y))
+                }
+            }
+            file.outputStream().use { fos ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
+            }
+            Log.d(TAG, "Release frame: cursor=$cursorX, target=$targetX → saved release_$ts.png")
+        } catch (e: Exception) {
+            Log.e(TAG, "saveReleaseFrame failed: ${e.message}")
+        }
     }
 }
 
