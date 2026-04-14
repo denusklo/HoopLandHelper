@@ -47,11 +47,11 @@ class GreenZoneDetector(
     fun analyzeBar(width: Int, height: Int, getPixel: (Int, Int) -> Int): BarAnalysis {
         val midY = height / 2
 
-        // Save first frame as debug PNG only
-        if (frameDumpCount < 1 && debugDir != null) {
-            saveDebugPng(width, height, getPixel, frameDumpCount)
-            frameDumpCount++
-        }
+        // Debug PNG saving disabled to reduce thermal load during gameplay
+        // if (frameDumpCount < 1 && debugDir != null) {
+        //     saveDebugPng(width, height, getPixel, frameDumpCount)
+        //     frameDumpCount++
+        // }
 
         // Find cursor (brightest pixel) and green zone boundaries in one pass
         var maxBrightness = 0
@@ -109,6 +109,13 @@ class GreenZoneDetector(
 
         // Cursor threshold
         if (maxBrightness <= 600) cursorX = -1
+
+        // Green zone width validation: real zones are 6-14px; anything >25px is a false detection
+        // (e.g., green-ish court/background being misidentified)
+        if (bestGreenWidth > 25) {
+            bestGreenStart = -1
+            bestGreenEnd = -1
+        }
 
         return BarAnalysis(
             cursorX = cursorX,
@@ -229,7 +236,7 @@ class GreenZoneDetector(
         try {
             val dir = java.io.File(debugDir)
             if (!dir.exists()) dir.mkdirs()
-            val ts = System.currentTimeMillis() % 100000
+            val ts = System.currentTimeMillis()
             val file = java.io.File(dir, "release_$ts.png")
             val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
             for (x in 0 until width) {
