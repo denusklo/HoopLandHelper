@@ -11,13 +11,16 @@ class ShotManager(
     private val calibration: CalibrationRepository,
     private val frameProvider: FrameProvider,
     private val timeoutMs: Long = 3000L,
-    private val releaseLatencyMs: Long = 200L,
+    initialLatencyMs: Long = 200L,
     private val isGreenPixelOverride: ((Int) -> Boolean)? = null,
     private val debugDir: String? = null,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 ) {
     private var currentJob: Job? = null
     private var isRunning = false
+
+    // Fixed release latency (ms) — tuned empirically for sendevent pipeline
+    private val releaseLatencyMs = initialLatencyMs
 
     fun shoot(onResult: (Boolean) -> Unit) {
         if (!calibration.isCalibrated()) {
@@ -56,13 +59,13 @@ class ShotManager(
             var targetX = 0
             var frameCount = 0
 
-            // Speed tracking: measure only between unique cursor positions
-            // to avoid duplicate frames dragging down the average speed.
+            // Speed tracking: sliding window of recent cursor transitions
             var lastUniqueX = -1
             var lastUniqueTime = 0L
-            var speedSum = 0f
             var speedCount = 0
             var smoothSpeed = 0f
+            val recentSteps = mutableListOf<Pair<Int, Long>>() // (dx, dt) sliding window
+            val SPEED_WINDOW = 8
 
             while (isActive && System.currentTimeMillis() < deadline) {
                 val frame = frameProvider()
@@ -77,22 +80,29 @@ class ShotManager(
                             foundGreen = true
                             lastUniqueX = analysis.cursorX
                             lastUniqueTime = now
-                            targetX = analysis.greenLeft  // target left edge for max margin
                             val timeFromHoldStart = now - shotStartTime
-                            Log.d(TAG, "DETECTED: cursor=${analysis.cursorX}, green=${analysis.greenLeft}..${analysis.greenRight}, target=LEFT_EDGE=$targetX, holdStart=${timeFromHoldStart}ms, frame #$frameCount")
+                            Log.d(TAG, "DETECTED: cursor=${analysis.cursorX}, green=${analysis.greenLeft}..${analysis.greenRight}, holdStart=${timeFromHoldStart}ms, frame #$frameCount")
+                        }
+
+                        // Update target every frame — green zone can shift during shot
+                        if (analysis.greenLeft != targetX) {
+                            targetX = analysis.greenLeft
                         }
 
                         val remaining = targetX - analysis.cursorX
 
-                        // Update speed from unique cursor transitions only (skip duplicates)
+                        // Update speed from unique cursor transitions (sliding window)
                         if (analysis.cursorX != lastUniqueX && lastUniqueX >= 0) {
                             val stepDx = analysis.cursorX - lastUniqueX
                             val stepDt = now - lastUniqueTime
                             if (stepDt > 0 && stepDx > 0) {
+                                recentSteps.add(Pair(stepDx, stepDt))
+                                if (recentSteps.size > SPEED_WINDOW) recentSteps.removeAt(0)
+                                speedCount = recentSteps.size
+                                val totalDist = recentSteps.sumOf { it.first }
+                                val totalTime = recentSteps.sumOf { it.second }
+                                smoothSpeed = totalDist.toFloat() / totalTime.toFloat()
                                 val stepSpeed = stepDx.toFloat() / stepDt.toFloat()
-                                speedSum += stepSpeed
-                                speedCount++
-                                smoothSpeed = speedSum / speedCount
                                 Log.d(TAG, "SPEED: step=${stepDx}px/${stepDt}ms=${String.format("%.3f", stepSpeed)}px/ms, smooth=${String.format("%.3f", smoothSpeed)}px/ms (#$speedCount)")
                             }
                             lastUniqueX = analysis.cursorX
@@ -100,7 +110,6 @@ class ShotManager(
                         }
 
                         if (remaining <= 0) {
-                            // Already past target — release immediately
                             Log.d(TAG, "RELEASE NOW: cursor=${analysis.cursorX} already past target=$targetX")
                             touchInjector.release()
                             isRunning = false
@@ -108,11 +117,9 @@ class ShotManager(
                             return@launch
                         }
 
-                        // Need at least 2 unique-position speed samples for reliable prediction
-                        if (speedCount >= 2) {
+                        if (speedCount >= 5) {
                             val timeToTarget = if (smoothSpeed > 0) (remaining / smoothSpeed).toLong() else Long.MAX_VALUE
 
-                            // Log near release zone (within 60px)
                             if (remaining < 60) {
                                 Log.d(TAG, "APPROACH: cursor=${analysis.cursorX}, speed=${String.format("%.3f", smoothSpeed)}px/ms, remaining=${remaining}px, timeToTarget=${timeToTarget}ms")
                             }
@@ -121,7 +128,8 @@ class ShotManager(
                                 Log.d(TAG, "RELEASE: cursor=${analysis.cursorX}, speed=${String.format("%.3f", smoothSpeed)}px/ms, remaining=${remaining}px, timeToTarget=${timeToTarget}ms <= latency=${releaseLatencyMs}ms")
                                 touchInjector.release()
                                 val releaseTargetX = targetX
-                                // Capture release frame in background for analysis
+                                val releaseCursorX = analysis.cursorX
+                                val releaseSpeed = smoothSpeed
                                 scope.launch(Dispatchers.IO) {
                                     delay(200)
                                     val relFrame = frameProvider()
@@ -138,7 +146,12 @@ class ShotManager(
                                             }
                                             val greenInfo = if (relAnalysis.hasGreenZone) "${relAnalysis.greenLeft}..${relAnalysis.greenRight}" else "none"
                                             Log.d(TAG, "Release analysis: cursor=${relAnalysis.cursorX}, green=$greenInfo, target=$releaseTargetX → $verdict")
-                                            detector.saveReleaseFrame(rw, rh, rp, relAnalysis.cursorX, releaseTargetX)
+                                            // Log measured latency for monitoring (fixed latency, no adaptation)
+                                            val travelPx = relAnalysis.cursorX - releaseCursorX
+                                            if (travelPx > 0 && releaseSpeed > 0f) {
+                                                val measuredLatency = (travelPx / releaseSpeed).toLong()
+                                                Log.d(TAG, "Measured latency: ${measuredLatency}ms (fixed=${releaseLatencyMs}ms)")
+                                            }
                                         } else {
                                             Log.d(TAG, "Release frame: no cursor found (bar may have disappeared)")
                                         }
