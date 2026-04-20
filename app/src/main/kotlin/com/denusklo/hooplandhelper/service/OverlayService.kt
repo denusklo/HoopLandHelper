@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.IBinder
@@ -18,9 +19,12 @@ import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.denusklo.hooplandhelper.R
 import com.denusklo.hooplandhelper.core.AdbRelayClient
+import com.denusklo.hooplandhelper.core.BarFrame
 import com.denusklo.hooplandhelper.core.ShotManager
 import com.denusklo.hooplandhelper.core.TouchInjector
 import com.denusklo.hooplandhelper.data.*
+import java.io.File
+import java.util.Locale
 import com.denusklo.hooplandhelper.utils.RootChecker
 
 class OverlayService : Service() {
@@ -238,6 +242,7 @@ class OverlayService : Service() {
             Log.d(TAG, "Bar rect: no frame available, skipping overlay")
             return
         }
+        saveCalibrationBarRegionPreview(region, frame)
         val (w, h, getPixel) = Triple(frame.width, frame.height, frame.getPixel)
         var totalBrightness = 0
         var samples = 0
@@ -277,6 +282,57 @@ class OverlayService : Service() {
         windowManager.addView(rectView, params)
         barRectView = rectView
         Log.d(TAG, "Bar rect overlay shown at (${region.left},${region.top}) ${width}x${height}")
+    }
+
+    private fun saveCalibrationBarRegionPreview(region: BarRegion, frame: BarFrame) {
+        Thread {
+            try {
+                val debugRoot = getExternalFilesDir(null) ?: return@Thread
+                val dir = File(debugRoot, "debug")
+                if (!dir.exists()) dir.mkdirs()
+
+                val width = frame.width
+                val height = frame.height
+                if (width <= 0 || height <= 0) return@Thread
+
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                var brightnessSum = 0L
+
+                for (y in 0 until height) {
+                    for (x in 0 until width) {
+                        val pixel = frame.getPixel(x, y)
+                        bitmap.setPixel(x, y, pixel)
+                        brightnessSum += brightnessOf(pixel).toLong()
+                    }
+                }
+
+                val avgBrightness = brightnessSum.toDouble() / (width * height).toDouble()
+                val file = File(dir, "calibration_bar_region_preview.png")
+                file.outputStream().use { fos ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                }
+                bitmap.recycle()
+
+                Log.d(
+                    TAG,
+                    "CALIBRATION_BAR_REGION_CHECK: display=(${region.left},${region.top},${region.right},${region.bottom}), " +
+                        "roiSize=${width}x${height}, avgBrightness=${String.format(Locale.US, "%.1f", avgBrightness)}"
+                )
+                Log.d(
+                    TAG,
+                    "CALIBRATION_BAR_REGION_PREVIEW: file=${file.absolutePath}, size=${width}x${height}"
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "CALIBRATION_BAR_REGION_PREVIEW_FAILED: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun brightnessOf(pixel: Int): Int {
+        val r = (pixel shr 16) and 0xFF
+        val g = (pixel shr 8) and 0xFF
+        val b = pixel and 0xFF
+        return (299 * r + 587 * g + 114 * b) / 1000
     }
 
     private fun removeBarRectOverlay() {
