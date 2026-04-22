@@ -27,3 +27,4 @@ google-services.json
 .claude/
 CLAUDE.md
 *.log
+.codex
