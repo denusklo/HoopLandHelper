@@ -142,7 +142,7 @@ class ShotManager(
     private val boundaryAlignedSlowRisk = 0.20f
     private val boundaryAlignedFastCoastMinMs = 120f
     private val boundaryAlignedMinSlowSamplesForBlend = 2
-    private val boundaryAlignedPostQuantizationCorrectionFrames = 0.5f
+    private val boundaryAlignedPostQuantizationCorrectionFrames = 0.25f
     private val boundaryAlignedFrameBoundaryGuard = 0.08f
     private val boundaryAlignedMaxPllStddevMs = 2.5f
     private val waitTooLongCoastMaxMs = 95f
