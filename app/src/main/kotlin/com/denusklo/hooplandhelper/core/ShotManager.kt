@@ -50,6 +50,11 @@ private data class BoundaryConfidenceGate(
     val fallbackPolicy: String
 )
 
+private data class ReleaseWindowOffsets(
+    val leftOffsetPx: Int,
+    val rightMarginPx: Int
+)
+
 /**
  * Per-shot trace data for instrumentation logging.
  * Build 6: PhasePlan architecture — shadow mode first, live mode after validation.
@@ -147,6 +152,10 @@ class ShotManager(
     private val boundaryAlignedGateLabel = "relaxed_pll_boundary"
     private val boundaryAlignedFrameBoundaryGuard = 0.08f
     private val boundaryAlignedMaxPllStddevMs = 2.5f
+    private val boundaryAlignedReleaseWindowLeftOffsetPx = 0
+    private val boundaryAlignedReleaseWindowRightMarginPx = 1
+    private val waitTooLongReleaseWindowLeftOffsetPx = 0
+    private val waitTooLongReleaseWindowRightMarginPx = 1
     private val waitTooLongCoastMaxMs = 95f
 
     // Phase offset: positive delays target flush later relative to predicted boundary.
@@ -192,7 +201,7 @@ class ShotManager(
         Log.d(TAG, "SHOT_START: shotId=$shotId, mode=fixed, fixedLatencyMs=${releaseLatencyMs}, phaseMode=$phaseMode, targetMode=${trace.targetMode}, holdStartNs=${trace.holdStartNs}")
         Log.d(
             TAG,
-            "TIMING_MODEL_CONFIG: shotId=$shotId, baCorrectionFrames=${String.format("%.3f", boundaryAlignedPostQuantizationCorrectionFrames)}, baQuantizer=$boundaryAlignedQuantizerLabel, baGate=$boundaryAlignedGateLabel, wtlCapMs=${String.format("%.1f", waitTooLongCoastMaxMs)}"
+            "TIMING_MODEL_CONFIG: shotId=$shotId, baCorrectionFrames=${String.format("%.3f", boundaryAlignedPostQuantizationCorrectionFrames)}, baQuantizer=$boundaryAlignedQuantizerLabel, baGate=$boundaryAlignedGateLabel, wtlCapMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, baWindowLeftOffsetPx=$boundaryAlignedReleaseWindowLeftOffsetPx, baWindowRightMarginPx=$boundaryAlignedReleaseWindowRightMarginPx, wtlWindowLeftOffsetPx=$waitTooLongReleaseWindowLeftOffsetPx, wtlWindowRightMarginPx=$waitTooLongReleaseWindowRightMarginPx"
         )
         detector.resetDebug()
         frameClock.reset()
@@ -388,11 +397,24 @@ class ShotManager(
                                 "wait_too_long" -> learnedCoastMs!!
                                 else -> releaseLatencyMs.toFloat()
                             }
+                            val releaseWindowOffsets = getReleaseWindowOffsets(livePolicy)
+                            val releaseWindowLeft =
+                                analysis.greenLeft + releaseWindowOffsets.leftOffsetPx
+                            val releaseWindowRight =
+                                analysis.greenRight - releaseWindowOffsets.rightMarginPx
+                            val predictedStopX =
+                                analysis.cursorX + smoothSpeed * effectiveLatencyMs
+                            val predictedStopState =
+                                when {
+                                    predictedStopX < releaseWindowLeft -> "before_window"
+                                    predictedStopX > releaseWindowRight -> "past_window"
+                                    else -> "inside_window"
+                                }
 
                             if (plan != null && learnedCoastMs != null) {
                                 Log.d(
                                     TAG,
-                                    "LATENCY_MODEL_USE: policy=$livePolicy, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, learnedCoastMs=${String.format("%.1f", learnedCoastMs)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
+                                    "LATENCY_MODEL_USE: policy=$livePolicy, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, learnedCoastMs=${String.format("%.1f", learnedCoastMs)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
                                 )
                             }
                             if (livePolicy == "wait_too_long" && rawLearnedWaitTooLongCoastMs != null && liveWaitTooLongCoastMs != null) {
@@ -401,8 +423,14 @@ class ShotManager(
                                     "WAIT_TOO_LONG_CLAMP_USE: shotId=$shotId, rawLearnedCoastMs=${String.format("%.1f", rawLearnedWaitTooLongCoastMs)}, clampedCoastMs=${String.format("%.1f", liveWaitTooLongCoastMs)}, capMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, capApplied=${rawLearnedWaitTooLongCoastMs > liveWaitTooLongCoastMs}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
                                 )
                             }
+                            if (remaining < 80) {
+                                Log.d(
+                                    TAG,
+                                    "PREDICTED_STOP_WINDOW: shotId=$shotId, policy=${livePolicy ?: "baseline"}, cursorX=${analysis.cursorX}, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, green=${analysis.greenLeft}..${analysis.greenRight}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
+                                )
+                            }
 
-                            if (remaining <= smoothSpeed * effectiveLatencyMs) {
+                            if (predictedStopX >= releaseWindowLeft) {
                                 val releaseCursorX = analysis.cursorX
                                 val releaseTargetX = targetX
 
@@ -426,7 +454,7 @@ class ShotManager(
                                     trace.effectiveLatencyMs = effectiveLatencyMs
                                     trace.phasePolicy = livePolicy ?: plan.policy
 
-                                    Log.d(TAG, "PHASE_PLAN: shotId=$shotId, decisionNs=$nowNano, decisionFrameTsNs=${frame.timestampNs}, estimatedNowCaptureNs=${plan.estimatedNowCaptureNs}, boundaryCaptureNs=${plan.boundaryCaptureNs}, boundarySystemNs=${plan.boundarySystemNs}, targetSendIntentNs=${plan.targetSendIntentNs}, targetSendFlushNs=${plan.targetSendFlushNs}, plannedWaitMs=${String.format("%.1f", plan.plannedWaitNs / 1_000_000f)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, bridgeOffsetMs=${String.format("%.1f", plan.bridgeOffsetNs / 1_000_000f)}, bridgeJitterMs=${String.format("%.2f", plan.bridgeJitterNs / 1_000_000f)}, expectedSendOverheadMs=${String.format("%.1f", expectedSendOverheadNs / 1_000_000f)}, policy=$livePolicy, phaseMode=$phaseMode")
+                                    Log.d(TAG, "PHASE_PLAN: shotId=$shotId, decisionNs=$nowNano, decisionFrameTsNs=${frame.timestampNs}, estimatedNowCaptureNs=${plan.estimatedNowCaptureNs}, boundaryCaptureNs=${plan.boundaryCaptureNs}, boundarySystemNs=${plan.boundarySystemNs}, targetSendIntentNs=${plan.targetSendIntentNs}, targetSendFlushNs=${plan.targetSendFlushNs}, plannedWaitMs=${String.format("%.1f", plan.plannedWaitNs / 1_000_000f)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, bridgeOffsetMs=${String.format("%.1f", plan.bridgeOffsetNs / 1_000_000f)}, bridgeJitterMs=${String.format("%.2f", plan.bridgeJitterNs / 1_000_000f)}, expectedSendOverheadMs=${String.format("%.1f", expectedSendOverheadNs / 1_000_000f)}, policy=$livePolicy, phaseMode=$phaseMode")
 
                                     if (plan.policy == "boundary_aligned") {
                                         if (livePolicy == "boundary_aligned") {
@@ -456,13 +484,13 @@ class ShotManager(
                                         if (boundaryBlendEstimate != null && livePolicy == "boundary_aligned") {
                                             Log.d(
                                                 TAG,
-                                                "BOUNDARY_BLEND_USE: shotId=$shotId, learnedFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.liveFastCoastMs)}, learnedSlowCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedSlowCoastMs)}, slowSamples=${boundaryBlendEstimate.slowSamples}, slowBlendActive=${boundaryBlendEstimate.slowBlendActive}, minSlowSamples=${boundaryAlignedMinSlowSamplesForBlend}, slowRisk=${String.format("%.2f", boundaryAlignedSlowRisk)}, quantizer=$boundaryAlignedQuantizerLabel, estimatedPeriodMs=${String.format("%.2f", boundaryBlendEstimate.estimatedPeriodMs)}, rawBlendedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawBlendedBoundaryCoastMs)}, frameRatio=${String.format("%.2f", boundaryBlendEstimate.frameRatio)}, quantizedFrames=${String.format("%.1f", boundaryBlendEstimate.quantizedFrames)}, rawQuantizedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawQuantizedBoundaryCoastMs)}, correctionMs=${String.format("%.1f", boundaryBlendEstimate.correctionMs)}, correctedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.correctedBoundaryCoastMs)}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
+                                                "BOUNDARY_BLEND_USE: shotId=$shotId, learnedFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.liveFastCoastMs)}, learnedSlowCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedSlowCoastMs)}, slowSamples=${boundaryBlendEstimate.slowSamples}, slowBlendActive=${boundaryBlendEstimate.slowBlendActive}, minSlowSamples=${boundaryAlignedMinSlowSamplesForBlend}, slowRisk=${String.format("%.2f", boundaryAlignedSlowRisk)}, quantizer=$boundaryAlignedQuantizerLabel, estimatedPeriodMs=${String.format("%.2f", boundaryBlendEstimate.estimatedPeriodMs)}, rawBlendedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawBlendedBoundaryCoastMs)}, frameRatio=${String.format("%.2f", boundaryBlendEstimate.frameRatio)}, quantizedFrames=${String.format("%.1f", boundaryBlendEstimate.quantizedFrames)}, rawQuantizedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawQuantizedBoundaryCoastMs)}, correctionMs=${String.format("%.1f", boundaryBlendEstimate.correctionMs)}, correctedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.correctedBoundaryCoastMs)}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
                                             )
                                         }
                                     }
                                 }
 
-                                Log.d(TAG, "RELEASE_DECIDE: shotId=$shotId, decisionNs=$nowNano, decisionFrameSeq=${frame.frameSeq}, decisionFrameTsNs=${frame.timestampNs}, decisionCursorX=${analysis.cursorX}, targetX=$targetX, remainingPx=$remaining, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, fixedLatencyMs=${releaseLatencyMs}, decisionGreen=${analysis.greenLeft}..${analysis.greenRight}, policy=${livePolicy ?: "baseline"}")
+                                Log.d(TAG, "RELEASE_DECIDE: shotId=$shotId, decisionNs=$nowNano, decisionFrameSeq=${frame.frameSeq}, decisionFrameTsNs=${frame.timestampNs}, decisionCursorX=${analysis.cursorX}, targetX=$targetX, remainingPx=$remaining, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, fixedLatencyMs=${releaseLatencyMs}, decisionGreen=${analysis.greenLeft}..${analysis.greenRight}, policy=${livePolicy ?: "baseline"}")
 
                                 // Phase-aligned sleep in LIVE mode
                                 if (phaseMode == PhaseAlignMode.LIVE && plan != null && livePolicy == "boundary_aligned" && plan.plannedWaitNs > 1_000_000L) {
@@ -975,6 +1003,19 @@ class ShotManager(
             slowBlendActive = slowBlendActive
         )
     }
+
+    private fun getReleaseWindowOffsets(policy: String?): ReleaseWindowOffsets =
+        when (policy) {
+            "boundary_aligned" -> ReleaseWindowOffsets(
+                leftOffsetPx = boundaryAlignedReleaseWindowLeftOffsetPx,
+                rightMarginPx = boundaryAlignedReleaseWindowRightMarginPx
+            )
+            "wait_too_long" -> ReleaseWindowOffsets(
+                leftOffsetPx = waitTooLongReleaseWindowLeftOffsetPx,
+                rightMarginPx = waitTooLongReleaseWindowRightMarginPx
+            )
+            else -> ReleaseWindowOffsets(leftOffsetPx = 0, rightMarginPx = 1)
+        }
 
     private fun evaluateBoundaryConfidenceGate(
         estimate: BoundaryBlendEstimate,
