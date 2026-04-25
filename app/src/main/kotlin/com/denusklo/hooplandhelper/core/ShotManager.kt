@@ -143,6 +143,8 @@ class ShotManager(
     private val boundaryAlignedFastCoastMinMs = 120f
     private val boundaryAlignedMinSlowSamplesForBlend = 2
     private val boundaryAlignedPostQuantizationCorrectionFrames = 0.375f
+    private val boundaryAlignedQuantizerLabel = "half_frame_3_3.5_4"
+    private val boundaryAlignedGateLabel = "relaxed_pll_boundary"
     private val boundaryAlignedFrameBoundaryGuard = 0.08f
     private val boundaryAlignedMaxPllStddevMs = 2.5f
     private val waitTooLongCoastMaxMs = 95f
@@ -188,6 +190,10 @@ class ShotManager(
         )
 
         Log.d(TAG, "SHOT_START: shotId=$shotId, mode=fixed, fixedLatencyMs=${releaseLatencyMs}, phaseMode=$phaseMode, targetMode=${trace.targetMode}, holdStartNs=${trace.holdStartNs}")
+        Log.d(
+            TAG,
+            "TIMING_MODEL_CONFIG: shotId=$shotId, baCorrectionFrames=${String.format("%.3f", boundaryAlignedPostQuantizationCorrectionFrames)}, baQuantizer=$boundaryAlignedQuantizerLabel, baGate=$boundaryAlignedGateLabel, wtlCapMs=${String.format("%.1f", waitTooLongCoastMaxMs)}"
+        )
         detector.resetDebug()
         frameClock.reset()
         clockBridge.reset()
@@ -354,6 +360,12 @@ class ShotManager(
                                     TAG,
                                     "BOUNDARY_CONFIDENCE_GATE: shotId=$shotId, baAllowed=${boundaryConfidenceGate.baAllowed}, reason=${boundaryConfidenceGate.reason}, warning=${boundaryConfidenceGate.warning}, pllStddevMs=${formatOptionalMs(boundaryConfidenceGate.pllStddevMs)}, pllStable=${boundaryConfidenceGate.pllStable}, frameRatio=${String.format("%.2f", estimate.frameRatio)}, nearFrameBoundary=${boundaryConfidenceGate.nearFrameBoundary}, learnedFastCoastMs=${String.format("%.1f", estimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", estimate.liveFastCoastMs)}, fastFloorActive=${boundaryConfidenceGate.fastFloorActive}, fallbackPolicy=${boundaryConfidenceGate.fallbackPolicy}"
                                 )
+                                if (!boundaryConfidenceGate.baAllowed) {
+                                    Log.d(
+                                        TAG,
+                                        "BOUNDARY_FALLBACK_ACCOUNT: shotId=$shotId, fallbackReason=${boundaryConfidenceGate.reason}, frameRatio=${String.format("%.2f", estimate.frameRatio)}, pllStddevMs=${formatOptionalMs(boundaryConfidenceGate.pllStddevMs)}, baGate=$boundaryAlignedGateLabel, fallbackPolicy=${boundaryConfidenceGate.fallbackPolicy}"
+                                    )
+                                }
                             }
                             val livePolicy =
                                 if (plan?.policy == "boundary_aligned" && boundaryConfidenceGate?.baAllowed == false) {
@@ -444,7 +456,7 @@ class ShotManager(
                                         if (boundaryBlendEstimate != null && livePolicy == "boundary_aligned") {
                                             Log.d(
                                                 TAG,
-                                                "BOUNDARY_BLEND_USE: shotId=$shotId, learnedFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.liveFastCoastMs)}, learnedSlowCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedSlowCoastMs)}, slowSamples=${boundaryBlendEstimate.slowSamples}, slowBlendActive=${boundaryBlendEstimate.slowBlendActive}, minSlowSamples=${boundaryAlignedMinSlowSamplesForBlend}, slowRisk=${String.format("%.2f", boundaryAlignedSlowRisk)}, quantizer=half_frame_3_3.5_4, estimatedPeriodMs=${String.format("%.2f", boundaryBlendEstimate.estimatedPeriodMs)}, rawBlendedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawBlendedBoundaryCoastMs)}, frameRatio=${String.format("%.2f", boundaryBlendEstimate.frameRatio)}, quantizedFrames=${String.format("%.1f", boundaryBlendEstimate.quantizedFrames)}, rawQuantizedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawQuantizedBoundaryCoastMs)}, correctionMs=${String.format("%.1f", boundaryBlendEstimate.correctionMs)}, correctedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.correctedBoundaryCoastMs)}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
+                                                "BOUNDARY_BLEND_USE: shotId=$shotId, learnedFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.liveFastCoastMs)}, learnedSlowCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedSlowCoastMs)}, slowSamples=${boundaryBlendEstimate.slowSamples}, slowBlendActive=${boundaryBlendEstimate.slowBlendActive}, minSlowSamples=${boundaryAlignedMinSlowSamplesForBlend}, slowRisk=${String.format("%.2f", boundaryAlignedSlowRisk)}, quantizer=$boundaryAlignedQuantizerLabel, estimatedPeriodMs=${String.format("%.2f", boundaryBlendEstimate.estimatedPeriodMs)}, rawBlendedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawBlendedBoundaryCoastMs)}, frameRatio=${String.format("%.2f", boundaryBlendEstimate.frameRatio)}, quantizedFrames=${String.format("%.1f", boundaryBlendEstimate.quantizedFrames)}, rawQuantizedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawQuantizedBoundaryCoastMs)}, correctionMs=${String.format("%.1f", boundaryBlendEstimate.correctionMs)}, correctedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.correctedBoundaryCoastMs)}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
                                             )
                                         }
                                     }
