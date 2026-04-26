@@ -156,6 +156,8 @@ class ShotManager(
     private val boundaryAlignedReleaseWindowRightMarginPx = 1
     private val waitTooLongReleaseWindowLeftOffsetPx = 0
     private val waitTooLongReleaseWindowRightMarginPx = 1
+    private val baselineReleaseWindowLeftOffsetPx = 0
+    private val baselineReleaseWindowRightMarginPx = 1
     private val waitTooLongCoastMaxMs = 95f
 
     // Phase offset: positive delays target flush later relative to predicted boundary.
@@ -423,12 +425,10 @@ class ShotManager(
                                     "WAIT_TOO_LONG_CLAMP_USE: shotId=$shotId, rawLearnedCoastMs=${String.format("%.1f", rawLearnedWaitTooLongCoastMs)}, clampedCoastMs=${String.format("%.1f", liveWaitTooLongCoastMs)}, capMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, capApplied=${rawLearnedWaitTooLongCoastMs > liveWaitTooLongCoastMs}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
                                 )
                             }
-                            if (remaining < 80) {
-                                Log.d(
-                                    TAG,
-                                    "PREDICTED_STOP_WINDOW: shotId=$shotId, policy=${livePolicy ?: "baseline"}, cursorX=${analysis.cursorX}, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, green=${analysis.greenLeft}..${analysis.greenRight}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
-                                )
-                            }
+                            Log.d(
+                                TAG,
+                                "PREDICTED_STOP_WINDOW: shotId=$shotId, policy=${livePolicy ?: "baseline"}, cursorX=${analysis.cursorX}, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, green=${analysis.greenLeft}..${analysis.greenRight}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
+                            )
 
                             if (predictedStopX >= releaseWindowLeft) {
                                 val releaseCursorX = analysis.cursorX
@@ -1014,7 +1014,10 @@ class ShotManager(
                 leftOffsetPx = waitTooLongReleaseWindowLeftOffsetPx,
                 rightMarginPx = waitTooLongReleaseWindowRightMarginPx
             )
-            else -> ReleaseWindowOffsets(leftOffsetPx = 0, rightMarginPx = 1)
+            else -> ReleaseWindowOffsets(
+                leftOffsetPx = baselineReleaseWindowLeftOffsetPx,
+                rightMarginPx = baselineReleaseWindowRightMarginPx
+            )
         }
 
     private fun evaluateBoundaryConfidenceGate(
