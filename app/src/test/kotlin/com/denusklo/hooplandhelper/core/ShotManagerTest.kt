@@ -45,18 +45,22 @@ class ShotManagerTest {
         var released = false
         val injector = mock<TouchInjector>()
         doAnswer { held = true }.whenever(injector).hold(any(), any(), any())
-        doAnswer { released = true }.whenever(injector).release()
+        doAnswer {
+            released = true
+            ReleaseStamp(sendIntentNs = 0L, sendFlushDoneNs = 0L, path = "test")
+        }.whenever(injector).release()
 
         // Simulate a bar where:
         // - Green zone is at x=45..55 (dark green)
-        // - Cursor starts at x=10 on frame 1, moves to x=20 on frame 2
+        // - Cursor starts at x=10 and advances through x=50, providing enough
+        //   transitions for the predictive release path to arm
         // - Cursor is WHITE, green zone is GREEN, rest is BLACK
         val WHITE = 0xFFFFFFFF.toInt()
         val GREEN = 0xFF00C800.toInt()
         val BLACK = 0xFF000000.toInt()
 
         var frameIndex = 0
-        val cursorPositions = listOf(10, 20)  // cursor moves 10px per frame
+        val cursorPositions = listOf(10, 20, 30, 40, 50)  // cursor moves 10px per frame
 
         val frameProvider: FrameProvider = {
             val cursorX = if (frameIndex < cursorPositions.size) cursorPositions[frameIndex] else cursorPositions.last()

@@ -28,3 +28,13 @@ google-services.json
 CLAUDE.md
 *.log
 .codex
+
+# Local harness notes and backups
+docs/harness/
+CLAUDE.md.bak
+
+# Python development artifacts
+pcshooter/.venv/
+pcshooter/logs/
+__pycache__/
+*.py[cod]

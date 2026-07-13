@@ -46,6 +46,7 @@ private data class BoundaryConfidenceGate(
     val pllStddevMs: Float,
     val pllStable: Boolean,
     val nearFrameBoundary: Boolean,
+    val nearFrameBoundaryOverride: Boolean,
     val fastFloorActive: Boolean,
     val fallbackPolicy: String
 )
@@ -84,6 +85,13 @@ private data class ShotTrace(
     var effectiveLatencyMs: Float = 0f,
     var phasePolicy: String = "",
     var phaseSleepApplied: Boolean = false,
+    var fallbackFromBaEnvelope: Boolean = false,
+    var fallbackFromBaCloseRange: Boolean = false,
+    var fallbackFromBaEffectiveLatency: Boolean = false,
+    var baFallbackReason: String = "none",
+    var recentWtlMedianSendToStopMs: Float = Float.NaN,
+    var wtlVarianceCorrectionMs: Float = 0f,
+    var wtlColdStartFloorApplied: Boolean = false,
     // Sleep trace fields
     var wakeNs: Long = 0,
     var wakeErrorNs: Long = 0,
@@ -141,24 +149,35 @@ class ShotManager(
     private val recentBoundaryAlignedRealizedBuckets = ArrayDeque<String>()
     private val recentBoundaryAlignedRealizedSendToStopMs = ArrayDeque<Float>()
     private val waitTooLongCoastHistoryMs = ArrayDeque<Float>()
+    private val recentWaitTooLongSendToStopMs = ArrayDeque<Float>()
     private val boundaryAlignedCoastWindowSize = 9
     private val boundaryAlignedShadowHistorySize = 3
     private val waitTooLongCoastWindowSize = 5
+    private val recentWaitTooLongSendToStopWindowSize = 5
     private val boundaryAlignedSlowRisk = 0.20f
     private val boundaryAlignedFastCoastMinMs = 120f
     private val boundaryAlignedMinSlowSamplesForBlend = 2
-    private val boundaryAlignedPostQuantizationCorrectionFrames = 0.375f
+    private val boundaryAlignedPostQuantizationCorrectionFrames = 0.5f
     private val boundaryAlignedQuantizerLabel = "half_frame_3_3.5_4"
     private val boundaryAlignedGateLabel = "relaxed_pll_boundary"
+    private val boundaryAlignedProbePreferBa = false
+    private val boundaryAlignedProbePlannerPreferBa = true
+    private val boundaryAlignedProbeWaitTooLongPeriodMultiplier = 2.5f
+    private val boundaryAlignedProbeEnvelopeGate = true
+    private val boundaryAlignedMinPlannedWaitMs = 85f
+    private val boundaryAlignedRequireShadowRightEdge = true
+    private val boundaryAlignedMinRemainingPx = 50
+    private val boundaryAlignedMaxEffectiveLatencyMs = 230f
     private val boundaryAlignedFrameBoundaryGuard = 0.08f
     private val boundaryAlignedMaxPllStddevMs = 2.5f
-    private val boundaryAlignedReleaseWindowLeftOffsetPx = 0
+    private val boundaryAlignedReleaseWindowLeftOffsetPx = -2
     private val boundaryAlignedReleaseWindowRightMarginPx = 1
     private val waitTooLongReleaseWindowLeftOffsetPx = 0
     private val waitTooLongReleaseWindowRightMarginPx = 1
     private val baselineReleaseWindowLeftOffsetPx = 0
     private val baselineReleaseWindowRightMarginPx = 1
-    private val waitTooLongCoastMaxMs = 95f
+    private val waitTooLongCoastMaxMs = 115f
+    private val waitTooLongColdStartFloorMs = 115f
 
     // Phase offset: positive delays target flush later relative to predicted boundary.
     // Offset tuning step for early-bias correction. Current: +58ms.
@@ -203,7 +222,7 @@ class ShotManager(
         Log.d(TAG, "SHOT_START: shotId=$shotId, mode=fixed, fixedLatencyMs=${releaseLatencyMs}, phaseMode=$phaseMode, targetMode=${trace.targetMode}, holdStartNs=${trace.holdStartNs}")
         Log.d(
             TAG,
-            "TIMING_MODEL_CONFIG: shotId=$shotId, baCorrectionFrames=${String.format("%.3f", boundaryAlignedPostQuantizationCorrectionFrames)}, baQuantizer=$boundaryAlignedQuantizerLabel, baGate=$boundaryAlignedGateLabel, wtlCapMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, baWindowLeftOffsetPx=$boundaryAlignedReleaseWindowLeftOffsetPx, baWindowRightMarginPx=$boundaryAlignedReleaseWindowRightMarginPx, wtlWindowLeftOffsetPx=$waitTooLongReleaseWindowLeftOffsetPx, wtlWindowRightMarginPx=$waitTooLongReleaseWindowRightMarginPx"
+            "TIMING_MODEL_CONFIG: shotId=$shotId, baCorrectionFrames=${String.format("%.3f", boundaryAlignedPostQuantizationCorrectionFrames)}, baQuantizer=$boundaryAlignedQuantizerLabel, baGate=$boundaryAlignedGateLabel, baEnvelopeGate=$boundaryAlignedProbeEnvelopeGate, baMinPlannedWaitMs=${String.format("%.1f", boundaryAlignedMinPlannedWaitMs)}, baRequireShadowRightEdge=$boundaryAlignedRequireShadowRightEdge, baMinRemainingPx=$boundaryAlignedMinRemainingPx, baMaxEffectiveLatencyMs=${String.format("%.1f", boundaryAlignedMaxEffectiveLatencyMs)}, plannerPreferBa=$boundaryAlignedProbePlannerPreferBa, waitTooLongPeriodMultiplier=${String.format("%.1f", getWaitTooLongPeriodMultiplier())}, wtlCapMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, baWindowLeftOffsetPx=$boundaryAlignedReleaseWindowLeftOffsetPx, baWindowRightMarginPx=$boundaryAlignedReleaseWindowRightMarginPx, wtlWindowLeftOffsetPx=$waitTooLongReleaseWindowLeftOffsetPx, wtlWindowRightMarginPx=$waitTooLongReleaseWindowRightMarginPx"
         )
         detector.resetDebug()
         frameClock.reset()
@@ -223,6 +242,12 @@ class ShotManager(
             var targetX = 0
             var frameCount = 0
             var dupCount = 0
+            var sawCursor = false
+            var sawGreen = false
+            var framesWithCursor = 0
+            var framesWithGreenAccepted = 0
+            var maxCursorXSeen = -1
+            var lastCursorX = -1
 
             // Speed tracking: sliding window of recent cursor transitions
             // Uses CAPTURE-domain timestamps (frame.timestampNs) for cadence
@@ -253,6 +278,18 @@ class ShotManager(
                     frameCount++
                     val analysis = detector.analyzeBar(frame.width, frame.height, frame.getPixel)
                     val nowNano = System.nanoTime()
+                    if (analysis.hasCursor) {
+                        sawCursor = true
+                        framesWithCursor++
+                        lastCursorX = analysis.cursorX
+                        if (analysis.cursorX > maxCursorXSeen) {
+                            maxCursorXSeen = analysis.cursorX
+                        }
+                    }
+                    if (analysis.hasGreenZone) {
+                        sawGreen = true
+                        framesWithGreenAccepted++
+                    }
 
                     if (analysis.hasCursor && analysis.hasGreenZone) {
                         // False-start guard: first cursor must be in left quarter of bar
@@ -369,7 +406,7 @@ class ShotManager(
                                 val estimate = boundaryBlendEstimate
                                 Log.d(
                                     TAG,
-                                    "BOUNDARY_CONFIDENCE_GATE: shotId=$shotId, baAllowed=${boundaryConfidenceGate.baAllowed}, reason=${boundaryConfidenceGate.reason}, warning=${boundaryConfidenceGate.warning}, pllStddevMs=${formatOptionalMs(boundaryConfidenceGate.pllStddevMs)}, pllStable=${boundaryConfidenceGate.pllStable}, frameRatio=${String.format("%.2f", estimate.frameRatio)}, nearFrameBoundary=${boundaryConfidenceGate.nearFrameBoundary}, learnedFastCoastMs=${String.format("%.1f", estimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", estimate.liveFastCoastMs)}, fastFloorActive=${boundaryConfidenceGate.fastFloorActive}, fallbackPolicy=${boundaryConfidenceGate.fallbackPolicy}"
+                                    "BOUNDARY_CONFIDENCE_GATE: shotId=$shotId, baAllowed=${boundaryConfidenceGate.baAllowed}, reason=${boundaryConfidenceGate.reason}, warning=${boundaryConfidenceGate.warning}, probePreferBa=$boundaryAlignedProbePreferBa, nearFrameBoundaryOverride=${boundaryConfidenceGate.nearFrameBoundaryOverride}, pllStddevMs=${formatOptionalMs(boundaryConfidenceGate.pllStddevMs)}, pllStable=${boundaryConfidenceGate.pllStable}, frameRatio=${String.format("%.2f", estimate.frameRatio)}, nearFrameBoundary=${boundaryConfidenceGate.nearFrameBoundary}, learnedFastCoastMs=${String.format("%.1f", estimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", estimate.liveFastCoastMs)}, fastFloorActive=${boundaryConfidenceGate.fastFloorActive}, fallbackPolicy=${boundaryConfidenceGate.fallbackPolicy}"
                                 )
                                 if (!boundaryConfidenceGate.baAllowed) {
                                     Log.d(
@@ -378,56 +415,196 @@ class ShotManager(
                                     )
                                 }
                             }
-                            val livePolicy =
+                            var livePolicy =
                                 if (plan?.policy == "boundary_aligned" && boundaryConfidenceGate?.baAllowed == false) {
                                     "wait_too_long"
                                 } else {
                                     plan?.policy
+                            }
+                            var rawLearnedWaitTooLongCoastMs: Float? = null
+                            var cappedWaitTooLongCoastMs: Float? = null
+                            var liveWaitTooLongCoastMs: Float? = null
+                            var recentWtlMedianSendToStopMs: Float? = null
+                            var recentWtlSampleCount = 0
+                            var wtlVarianceCorrectionMs = 0f
+                            var wtlColdStartFloorApplied = false
+                            var learnedCoastMs: Float? = null
+                            var effectiveLatencyMs = releaseLatencyMs.toFloat()
+                            var releaseWindowOffsets = getReleaseWindowOffsets(livePolicy)
+                            var releaseWindowLeft = 0
+                            var releaseWindowRight = 0
+                            var predictedStopX = 0f
+                            var predictedStopState = "before_window"
+                            var shadowRightEdgeWouldBlock = false
+                            var predictedStopPastRightByPx = 0f
+                            var releaseWindowWidthPx = 0
+                            var fallbackFromBaEnvelope = trace.fallbackFromBaEnvelope
+                            var fallbackFromBaCloseRange = trace.fallbackFromBaCloseRange
+                            var fallbackFromBaEffectiveLatency = trace.fallbackFromBaEffectiveLatency
+                            var baFallbackReason = trace.baFallbackReason
+
+                            fun markBaFallback(reason: String) {
+                                when (reason) {
+                                    "envelope" -> {
+                                        fallbackFromBaEnvelope = true
+                                        trace.fallbackFromBaEnvelope = true
+                                    }
+                                    "close_range" -> {
+                                        fallbackFromBaCloseRange = true
+                                        trace.fallbackFromBaCloseRange = true
+                                    }
+                                    "effective_latency" -> {
+                                        fallbackFromBaEffectiveLatency = true
+                                        trace.fallbackFromBaEffectiveLatency = true
+                                    }
                                 }
-                            val rawLearnedWaitTooLongCoastMs = when (livePolicy) {
-                                "wait_too_long" -> getLearnedWaitTooLongCoastMs()
-                                else -> null
-                            }
-                            val liveWaitTooLongCoastMs = rawLearnedWaitTooLongCoastMs?.coerceAtMost(waitTooLongCoastMaxMs)
-                            val learnedCoastMs = when (livePolicy) {
-                                "boundary_aligned" -> boundaryBlendEstimate!!.correctedBoundaryCoastMs
-                                "wait_too_long" -> liveWaitTooLongCoastMs!!
-                                else -> null
-                            }
-                            val effectiveLatencyMs = when (livePolicy) {
-                                "boundary_aligned" -> plannedWaitMsForPolicy + learnedCoastMs!!
-                                "wait_too_long" -> learnedCoastMs!!
-                                else -> releaseLatencyMs.toFloat()
-                            }
-                            val releaseWindowOffsets = getReleaseWindowOffsets(livePolicy)
-                            val releaseWindowLeft =
-                                analysis.greenLeft + releaseWindowOffsets.leftOffsetPx
-                            val releaseWindowRight =
-                                analysis.greenRight - releaseWindowOffsets.rightMarginPx
-                            val predictedStopX =
-                                analysis.cursorX + smoothSpeed * effectiveLatencyMs
-                            val predictedStopState =
-                                when {
-                                    predictedStopX < releaseWindowLeft -> "before_window"
-                                    predictedStopX > releaseWindowRight -> "past_window"
-                                    else -> "inside_window"
+                                if (baFallbackReason == "none") {
+                                    baFallbackReason = reason
+                                    trace.baFallbackReason = reason
                                 }
+                            }
+
+                            fun recomputeReleaseModel() {
+                                wtlColdStartFloorApplied = false
+                                rawLearnedWaitTooLongCoastMs = when (livePolicy) {
+                                    "wait_too_long" -> getLearnedWaitTooLongCoastMs()
+                                    else -> null
+                                }
+                                cappedWaitTooLongCoastMs =
+                                    rawLearnedWaitTooLongCoastMs?.coerceAtMost(waitTooLongCoastMaxMs)
+                                recentWtlMedianSendToStopMs = getRecentWaitTooLongSendToStopMedianMs()
+                                recentWtlSampleCount = recentWaitTooLongSendToStopMs.size
+                                wtlVarianceCorrectionMs =
+                                    if (livePolicy == "wait_too_long" && recentWtlSampleCount >= 3) {
+                                        when {
+                                            (recentWtlMedianSendToStopMs ?: 0f) >= 135f -> 20f
+                                            (recentWtlMedianSendToStopMs ?: 0f) >= 125f -> 10f
+                                            else -> 0f
+                                        }
+                                    } else {
+                                        0f
+                                    }
+                                liveWaitTooLongCoastMs =
+                                    cappedWaitTooLongCoastMs?.let { cappedCoast ->
+                                        val adjustedCoast =
+                                            if (livePolicy == "wait_too_long" && recentWtlSampleCount < 3) {
+                                                cappedCoast.coerceAtLeast(waitTooLongColdStartFloorMs)
+                                            } else {
+                                                cappedCoast + wtlVarianceCorrectionMs
+                                            }
+                                        wtlColdStartFloorApplied = adjustedCoast > cappedCoast
+                                        adjustedCoast
+                                            .coerceIn(90f, 135f)
+                                    }
+                                learnedCoastMs = when (livePolicy) {
+                                    "boundary_aligned" -> boundaryBlendEstimate!!.correctedBoundaryCoastMs
+                                    "wait_too_long" -> liveWaitTooLongCoastMs!!
+                                    else -> null
+                                }
+                                effectiveLatencyMs = when (livePolicy) {
+                                    "boundary_aligned" -> plannedWaitMsForPolicy + learnedCoastMs!!
+                                    "wait_too_long" -> learnedCoastMs!!
+                                    else -> releaseLatencyMs.toFloat()
+                                }
+                                releaseWindowOffsets = getReleaseWindowOffsets(livePolicy)
+                                releaseWindowLeft =
+                                    analysis.greenLeft + releaseWindowOffsets.leftOffsetPx
+                                releaseWindowRight =
+                                    analysis.greenRight - releaseWindowOffsets.rightMarginPx
+                                predictedStopX =
+                                    analysis.cursorX + smoothSpeed * effectiveLatencyMs
+                                predictedStopState =
+                                    when {
+                                        predictedStopX < releaseWindowLeft -> "before_window"
+                                        predictedStopX > releaseWindowRight -> "past_window"
+                                        else -> "inside_window"
+                                    }
+                                shadowRightEdgeWouldBlock = predictedStopX > releaseWindowRight
+                                predictedStopPastRightByPx = predictedStopX - releaseWindowRight
+                                releaseWindowWidthPx = releaseWindowRight - releaseWindowLeft + 1
+                            }
+
+                            recomputeReleaseModel()
+
+                            var baEnvelopeAllowed = true
+                            var baEnvelopeReason = "not_evaluated"
+                            if (boundaryAlignedProbeEnvelopeGate && livePolicy == "boundary_aligned") {
+                                val envelopeReasons = mutableListOf<String>()
+                                if (plannedWaitMsForPolicy < boundaryAlignedMinPlannedWaitMs) {
+                                    envelopeReasons += "planned_wait_too_low"
+                                }
+                                if (boundaryAlignedRequireShadowRightEdge && !shadowRightEdgeWouldBlock) {
+                                    envelopeReasons += "shadow_right_edge_required"
+                                }
+                                baEnvelopeAllowed = envelopeReasons.isEmpty()
+                                baEnvelopeReason =
+                                    if (baEnvelopeAllowed) "ok" else envelopeReasons.joinToString(",")
+                                Log.d(
+                                    TAG,
+                                    "BOUNDARY_ENVELOPE_GATE: shotId=$shotId, enabled=true, baEnvelopeAllowed=$baEnvelopeAllowed, reason=$baEnvelopeReason, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, minPlannedWaitMs=${String.format("%.1f", boundaryAlignedMinPlannedWaitMs)}, shadowRightEdgeWouldBlock=$shadowRightEdgeWouldBlock, requireShadowRightEdge=$boundaryAlignedRequireShadowRightEdge, fallbackPolicy=${if (baEnvelopeAllowed) "boundary_aligned" else "wait_too_long"}"
+                                )
+                                if (!baEnvelopeAllowed) {
+                                    markBaFallback("envelope")
+                                    livePolicy = "wait_too_long"
+                                    recomputeReleaseModel()
+                                }
+                            }
+                            var baCloseRangeAllowed = true
+                            var baCloseRangeReason = "not_evaluated"
+                            if (livePolicy == "boundary_aligned") {
+                                baCloseRangeAllowed = remaining >= boundaryAlignedMinRemainingPx
+                                baCloseRangeReason =
+                                    if (baCloseRangeAllowed) "ok" else "remaining_too_low"
+                                Log.d(
+                                    TAG,
+                                    "BOUNDARY_CLOSE_RANGE_GATE: shotId=$shotId, baCloseRangeAllowed=$baCloseRangeAllowed, reason=$baCloseRangeReason, remainingPx=$remaining, minRemainingPx=$boundaryAlignedMinRemainingPx, fallbackPolicy=${if (baCloseRangeAllowed) "boundary_aligned" else "wait_too_long"}"
+                                )
+                                if (!baCloseRangeAllowed) {
+                                    markBaFallback("close_range")
+                                    livePolicy = "wait_too_long"
+                                    recomputeReleaseModel()
+                                }
+                            }
+                            var baEffectiveLatencyAllowed = true
+                            var baEffectiveLatencyReason = "not_evaluated"
+                            if (livePolicy == "boundary_aligned") {
+                                baEffectiveLatencyAllowed =
+                                    effectiveLatencyMs <= boundaryAlignedMaxEffectiveLatencyMs
+                                baEffectiveLatencyReason =
+                                    if (baEffectiveLatencyAllowed) "ok" else "effective_latency_too_high"
+                                Log.d(
+                                    TAG,
+                                    "BOUNDARY_EFFECTIVE_LATENCY_GATE: shotId=$shotId, baEffectiveLatencyAllowed=$baEffectiveLatencyAllowed, reason=$baEffectiveLatencyReason, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, maxEffectiveLatencyMs=${String.format("%.1f", boundaryAlignedMaxEffectiveLatencyMs)}, fallbackPolicy=${if (baEffectiveLatencyAllowed) "boundary_aligned" else "wait_too_long"}"
+                                )
+                                if (!baEffectiveLatencyAllowed) {
+                                    markBaFallback("effective_latency")
+                                    livePolicy = "wait_too_long"
+                                    recomputeReleaseModel()
+                                }
+                            }
 
                             if (plan != null && learnedCoastMs != null) {
                                 Log.d(
                                     TAG,
-                                    "LATENCY_MODEL_USE: policy=$livePolicy, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, learnedCoastMs=${String.format("%.1f", learnedCoastMs)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
+                                    "LATENCY_MODEL_USE: policy=$livePolicy, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, learnedCoastMs=${String.format("%.1f", learnedCoastMs)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, shadowRightEdgeWouldBlock=$shadowRightEdgeWouldBlock, predictedStopPastRightByPx=${String.format("%.1f", predictedStopPastRightByPx)}, releaseWindowWidthPx=$releaseWindowWidthPx, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, baEnvelopeAllowed=$baEnvelopeAllowed, baEnvelopeReason=$baEnvelopeReason, baCloseRangeAllowed=$baCloseRangeAllowed, baCloseRangeReason=$baCloseRangeReason, baEffectiveLatencyAllowed=$baEffectiveLatencyAllowed, baEffectiveLatencyReason=$baEffectiveLatencyReason"
                                 )
                             }
-                            if (livePolicy == "wait_too_long" && rawLearnedWaitTooLongCoastMs != null && liveWaitTooLongCoastMs != null) {
+                            val rawWaitTooLongCoastForLog = rawLearnedWaitTooLongCoastMs
+                            val cappedWaitTooLongCoastForLog = cappedWaitTooLongCoastMs
+                            val liveWaitTooLongCoastForLog = liveWaitTooLongCoastMs
+                            if (livePolicy == "wait_too_long" && rawWaitTooLongCoastForLog != null && cappedWaitTooLongCoastForLog != null && liveWaitTooLongCoastForLog != null) {
                                 Log.d(
                                     TAG,
-                                    "WAIT_TOO_LONG_CLAMP_USE: shotId=$shotId, rawLearnedCoastMs=${String.format("%.1f", rawLearnedWaitTooLongCoastMs)}, clampedCoastMs=${String.format("%.1f", liveWaitTooLongCoastMs)}, capMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, capApplied=${rawLearnedWaitTooLongCoastMs > liveWaitTooLongCoastMs}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
+                                    "WTL_VARIANCE_GUARD_USE: shotId=$shotId, rawLearnedCoastMs=${String.format("%.1f", rawWaitTooLongCoastForLog)}, cappedCoastMs=${String.format("%.1f", cappedWaitTooLongCoastForLog)}, recentWtlMedianSendToStopMs=${formatLearnedCoastMs(recentWtlMedianSendToStopMs)}, recentWtlSampleCount=$recentWtlSampleCount, varianceCorrectionMs=${String.format("%.1f", wtlVarianceCorrectionMs)}, coldStartFloorApplied=$wtlColdStartFloorApplied, coldStartFloorMs=${String.format("%.1f", waitTooLongColdStartFloorMs)}, adjustedCoastMs=${String.format("%.1f", liveWaitTooLongCoastForLog)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
+                                )
+                                Log.d(
+                                    TAG,
+                                    "WAIT_TOO_LONG_CLAMP_USE: shotId=$shotId, rawLearnedCoastMs=${String.format("%.1f", rawWaitTooLongCoastForLog)}, clampedCoastMs=${String.format("%.1f", cappedWaitTooLongCoastForLog)}, capMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, capApplied=${rawWaitTooLongCoastForLog > cappedWaitTooLongCoastForLog}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}"
                                 )
                             }
                             Log.d(
                                 TAG,
-                                "PREDICTED_STOP_WINDOW: shotId=$shotId, policy=${livePolicy ?: "baseline"}, cursorX=${analysis.cursorX}, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, green=${analysis.greenLeft}..${analysis.greenRight}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
+                                "PREDICTED_STOP_WINDOW: shotId=$shotId, policy=${livePolicy ?: "baseline"}, cursorX=${analysis.cursorX}, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, green=${analysis.greenLeft}..${analysis.greenRight}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, shadowRightEdgeWouldBlock=$shadowRightEdgeWouldBlock, predictedStopPastRightByPx=${String.format("%.1f", predictedStopPastRightByPx)}, releaseWindowWidthPx=$releaseWindowWidthPx, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, baEnvelopeAllowed=$baEnvelopeAllowed, baEnvelopeReason=$baEnvelopeReason, baCloseRangeAllowed=$baCloseRangeAllowed, baCloseRangeReason=$baCloseRangeReason, baEffectiveLatencyAllowed=$baEffectiveLatencyAllowed, baEffectiveLatencyReason=$baEffectiveLatencyReason"
                             )
 
                             if (predictedStopX >= releaseWindowLeft) {
@@ -443,6 +620,16 @@ class ShotManager(
                                 trace.decisionSpeedPxMs = smoothSpeed
                                 trace.decisionGreenLeft = analysis.greenLeft
                                 trace.decisionGreenRight = analysis.greenRight
+                                trace.effectiveLatencyMs = effectiveLatencyMs
+                                trace.phasePolicy = livePolicy ?: ""
+                                trace.fallbackFromBaEnvelope = fallbackFromBaEnvelope
+                                trace.fallbackFromBaCloseRange = fallbackFromBaCloseRange
+                                trace.fallbackFromBaEffectiveLatency = fallbackFromBaEffectiveLatency
+                                trace.baFallbackReason = baFallbackReason
+                                trace.recentWtlMedianSendToStopMs =
+                                    recentWtlMedianSendToStopMs ?: Float.NaN
+                                trace.wtlVarianceCorrectionMs = wtlVarianceCorrectionMs
+                                trace.wtlColdStartFloorApplied = wtlColdStartFloorApplied
 
                                 // Log phase plan
                                 if (plan != null) {
@@ -451,10 +638,9 @@ class ShotManager(
                                     trace.targetSendIntentNs = plan.targetSendIntentNs
                                     trace.targetSendFlushNs = plan.targetSendFlushNs
                                     trace.plannedWaitMs = plan.plannedWaitNs / 1_000_000f
-                                    trace.effectiveLatencyMs = effectiveLatencyMs
                                     trace.phasePolicy = livePolicy ?: plan.policy
 
-                                    Log.d(TAG, "PHASE_PLAN: shotId=$shotId, decisionNs=$nowNano, decisionFrameTsNs=${frame.timestampNs}, estimatedNowCaptureNs=${plan.estimatedNowCaptureNs}, boundaryCaptureNs=${plan.boundaryCaptureNs}, boundarySystemNs=${plan.boundarySystemNs}, targetSendIntentNs=${plan.targetSendIntentNs}, targetSendFlushNs=${plan.targetSendFlushNs}, plannedWaitMs=${String.format("%.1f", plan.plannedWaitNs / 1_000_000f)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, bridgeOffsetMs=${String.format("%.1f", plan.bridgeOffsetNs / 1_000_000f)}, bridgeJitterMs=${String.format("%.2f", plan.bridgeJitterNs / 1_000_000f)}, expectedSendOverheadMs=${String.format("%.1f", expectedSendOverheadNs / 1_000_000f)}, policy=$livePolicy, phaseMode=$phaseMode")
+                                    Log.d(TAG, "PHASE_PLAN: shotId=$shotId, decisionNs=$nowNano, decisionFrameTsNs=${frame.timestampNs}, estimatedNowCaptureNs=${plan.estimatedNowCaptureNs}, boundaryCaptureNs=${plan.boundaryCaptureNs}, boundarySystemNs=${plan.boundarySystemNs}, targetSendIntentNs=${plan.targetSendIntentNs}, targetSendFlushNs=${plan.targetSendFlushNs}, plannedWaitMs=${String.format("%.1f", plan.plannedWaitNs / 1_000_000f)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, shadowRightEdgeWouldBlock=$shadowRightEdgeWouldBlock, predictedStopPastRightByPx=${String.format("%.1f", predictedStopPastRightByPx)}, releaseWindowWidthPx=$releaseWindowWidthPx, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, baEnvelopeAllowed=$baEnvelopeAllowed, baEnvelopeReason=$baEnvelopeReason, baCloseRangeAllowed=$baCloseRangeAllowed, baCloseRangeReason=$baCloseRangeReason, baEffectiveLatencyAllowed=$baEffectiveLatencyAllowed, baEffectiveLatencyReason=$baEffectiveLatencyReason, plannerPreferBa=$boundaryAlignedProbePlannerPreferBa, waitTooLongThresholdMs=${String.format("%.1f", getWaitTooLongThresholdNs() / 1_000_000f)}, waitTooLongPeriodMultiplier=${String.format("%.1f", getWaitTooLongPeriodMultiplier())}, bridgeOffsetMs=${String.format("%.1f", plan.bridgeOffsetNs / 1_000_000f)}, bridgeJitterMs=${String.format("%.2f", plan.bridgeJitterNs / 1_000_000f)}, expectedSendOverheadMs=${String.format("%.1f", expectedSendOverheadNs / 1_000_000f)}, policy=$livePolicy, phaseMode=$phaseMode")
 
                                     if (plan.policy == "boundary_aligned") {
                                         if (livePolicy == "boundary_aligned") {
@@ -484,13 +670,13 @@ class ShotManager(
                                         if (boundaryBlendEstimate != null && livePolicy == "boundary_aligned") {
                                             Log.d(
                                                 TAG,
-                                                "BOUNDARY_BLEND_USE: shotId=$shotId, learnedFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.liveFastCoastMs)}, learnedSlowCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedSlowCoastMs)}, slowSamples=${boundaryBlendEstimate.slowSamples}, slowBlendActive=${boundaryBlendEstimate.slowBlendActive}, minSlowSamples=${boundaryAlignedMinSlowSamplesForBlend}, slowRisk=${String.format("%.2f", boundaryAlignedSlowRisk)}, quantizer=$boundaryAlignedQuantizerLabel, estimatedPeriodMs=${String.format("%.2f", boundaryBlendEstimate.estimatedPeriodMs)}, rawBlendedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawBlendedBoundaryCoastMs)}, frameRatio=${String.format("%.2f", boundaryBlendEstimate.frameRatio)}, quantizedFrames=${String.format("%.1f", boundaryBlendEstimate.quantizedFrames)}, rawQuantizedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawQuantizedBoundaryCoastMs)}, correctionMs=${String.format("%.1f", boundaryBlendEstimate.correctionMs)}, correctedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.correctedBoundaryCoastMs)}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
+                                                "BOUNDARY_BLEND_USE: shotId=$shotId, learnedFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedFastCoastMs)}, liveFastCoastMs=${String.format("%.1f", boundaryBlendEstimate.liveFastCoastMs)}, learnedSlowCoastMs=${String.format("%.1f", boundaryBlendEstimate.learnedSlowCoastMs)}, slowSamples=${boundaryBlendEstimate.slowSamples}, slowBlendActive=${boundaryBlendEstimate.slowBlendActive}, minSlowSamples=${boundaryAlignedMinSlowSamplesForBlend}, slowRisk=${String.format("%.2f", boundaryAlignedSlowRisk)}, quantizer=$boundaryAlignedQuantizerLabel, estimatedPeriodMs=${String.format("%.2f", boundaryBlendEstimate.estimatedPeriodMs)}, rawBlendedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawBlendedBoundaryCoastMs)}, frameRatio=${String.format("%.2f", boundaryBlendEstimate.frameRatio)}, quantizedFrames=${String.format("%.1f", boundaryBlendEstimate.quantizedFrames)}, rawQuantizedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.rawQuantizedBoundaryCoastMs)}, correctionMs=${String.format("%.1f", boundaryBlendEstimate.correctionMs)}, correctedBoundaryCoastMs=${String.format("%.1f", boundaryBlendEstimate.correctedBoundaryCoastMs)}, plannedWaitMs=${String.format("%.1f", plannedWaitMsForPolicy)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, shadowRightEdgeWouldBlock=$shadowRightEdgeWouldBlock, predictedStopPastRightByPx=${String.format("%.1f", predictedStopPastRightByPx)}, releaseWindowWidthPx=$releaseWindowWidthPx, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}"
                                             )
                                         }
                                     }
                                 }
 
-                                Log.d(TAG, "RELEASE_DECIDE: shotId=$shotId, decisionNs=$nowNano, decisionFrameSeq=${frame.frameSeq}, decisionFrameTsNs=${frame.timestampNs}, decisionCursorX=${analysis.cursorX}, targetX=$targetX, remainingPx=$remaining, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, fixedLatencyMs=${releaseLatencyMs}, decisionGreen=${analysis.greenLeft}..${analysis.greenRight}, policy=${livePolicy ?: "baseline"}")
+                                Log.d(TAG, "RELEASE_DECIDE: shotId=$shotId, decisionNs=$nowNano, decisionFrameSeq=${frame.frameSeq}, decisionFrameTsNs=${frame.timestampNs}, decisionCursorX=${analysis.cursorX}, targetX=$targetX, remainingPx=$remaining, speedPxMs=${String.format("%.3f", smoothSpeed)}, effectiveLatencyMs=${String.format("%.1f", effectiveLatencyMs)}, predictedStopX=${String.format("%.1f", predictedStopX)}, releaseWindow=$releaseWindowLeft..$releaseWindowRight, predictedStopState=$predictedStopState, shadowRightEdgeWouldBlock=$shadowRightEdgeWouldBlock, predictedStopPastRightByPx=${String.format("%.1f", predictedStopPastRightByPx)}, releaseWindowWidthPx=$releaseWindowWidthPx, policyLeftOffsetPx=${releaseWindowOffsets.leftOffsetPx}, policyRightMarginPx=${releaseWindowOffsets.rightMarginPx}, baEnvelopeAllowed=$baEnvelopeAllowed, baEnvelopeReason=$baEnvelopeReason, baCloseRangeAllowed=$baCloseRangeAllowed, baCloseRangeReason=$baCloseRangeReason, baEffectiveLatencyAllowed=$baEffectiveLatencyAllowed, baEffectiveLatencyReason=$baEffectiveLatencyReason, fallbackFromBaEnvelope=$fallbackFromBaEnvelope, fallbackFromBaCloseRange=$fallbackFromBaCloseRange, fallbackFromBaEffectiveLatency=$fallbackFromBaEffectiveLatency, baFallbackReason=$baFallbackReason, fixedLatencyMs=${releaseLatencyMs}, decisionGreen=${analysis.greenLeft}..${analysis.greenRight}, policy=${livePolicy ?: "baseline"}")
 
                                 // Phase-aligned sleep in LIVE mode
                                 if (phaseMode == PhaseAlignMode.LIVE && plan != null && livePolicy == "boundary_aligned" && plan.plannedWaitNs > 1_000_000L) {
@@ -541,7 +727,14 @@ class ShotManager(
                 delay(8L)
             }
 
-            Log.d(TAG, "SHOT_END: shotId=$shotId, result=TIMEOUT")
+            val timeoutReason =
+                when {
+                    !sawCursor && !sawGreen -> "no_cursor_no_green"
+                    sawCursor && !sawGreen -> "cursor_seen_no_green"
+                    sawGreen && !armed -> "green_seen_not_stable"
+                    else -> "cursor_and_green_never_armed"
+                }
+            Log.d(TAG, "SHOT_END: shotId=$shotId, result=TIMEOUT, timeoutReason=$timeoutReason, sawCursor=$sawCursor, framesWithCursor=$framesWithCursor, maxCursorXSeen=$maxCursorXSeen, framesWithGreenAccepted=$framesWithGreenAccepted, lastCursorX=$lastCursorX, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}")
             recordShotEndSessionState(trace, System.nanoTime())
             touchInjector.release()
             isRunning = false
@@ -579,13 +772,15 @@ class ShotManager(
 
         // How long to wait from now
         val plannedWaitNs = targetSendIntentNs - nowNs
+        val waitTooLongThresholdNs = getWaitTooLongThresholdNs()
+        val waitTooLongPeriodMultiplier = getWaitTooLongPeriodMultiplier()
 
         // Policy: skip if boundary already passed or wait too long
         val policy: String
         if (plannedWaitNs < -expectedSendOverheadNs) {
             // Boundary already passed by more than send overhead — no point waiting
             policy = "boundary_passed"
-        } else if (plannedWaitNs > frameClock.estimatedPeriodNs * 2) {
+        } else if (plannedWaitNs > waitTooLongThresholdNs) {
             // Wait longer than two frame periods — prediction is off
             policy = "wait_too_long"
         } else if (plannedWaitNs < 0) {
@@ -598,6 +793,10 @@ class ShotManager(
 
         // Effective latency: planned wait (clamped to 0) + baseline latency
         val effectiveLatencyNs = plannedWaitNs.coerceAtLeast(0) + releaseLatencyMs * 1_000_000L
+        Log.d(
+            TAG,
+            "PHASE_PLAN_POLICY: plannerPreferBa=$boundaryAlignedProbePlannerPreferBa, waitTooLongThresholdMs=${String.format("%.1f", waitTooLongThresholdNs / 1_000_000f)}, waitTooLongPeriodMultiplier=${String.format("%.1f", waitTooLongPeriodMultiplier)}, plannedWaitMs=${String.format("%.1f", plannedWaitNs / 1_000_000f)}, policy=$policy"
+        )
 
         return PhasePlan(
             boundaryCaptureNs = boundaryCaptureNs,
@@ -693,7 +892,7 @@ class ShotManager(
 
         // Exhausted polls without stable stop
         trace.result = "POLL_EXPIRED"
-        Log.d(TAG, "SHOT_END: shotId=$shotId, result=${trace.result}, inGreen=false, finalCursorX=$lastPostCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}")
+        Log.d(TAG, "SHOT_END: shotId=$shotId, result=${trace.result}, inGreen=false, finalCursorX=$lastPostCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}")
         recordShotEndSessionState(trace, System.nanoTime())
     }
 
@@ -768,6 +967,18 @@ class ShotManager(
         val postReleaseDriftLabel = postReleaseDriftPx?.toString() ?: "n/a"
         val decisionToFirstPostLabel =
             decisionToFirstPostMs?.let { String.format("%.1f", it) } ?: "n/a"
+        val decisionFrameAgeMs =
+            if (trace.sendFlushDoneNs > 0L && trace.decisionFrameTsNs > 0L) {
+                (trace.sendFlushDoneNs - trace.decisionFrameTsNs) / 1_000_000f
+            } else {
+                Float.NaN
+            }
+        val sendOverheadForDiagMs =
+            if (trace.sendFlushDoneNs >= trace.sendIntentNs && trace.sendIntentNs > 0L) {
+                (trace.sendFlushDoneNs - trace.sendIntentNs) / 1_000_000f
+            } else {
+                Float.NaN
+            }
         when (policyLabel) {
             "boundary_aligned" -> {
                 val wakeErrorUs = abs(trace.wakeErrorNs) / 1_000f
@@ -907,6 +1118,13 @@ class ShotManager(
                         "LATENCY_MODEL_UPDATE: policy=$policyLabel, observedSendToStopMs=${String.format("%.1f", sendToStopCaptureMs)}, learnedCoastMs=${String.format("%.1f", learnedCoastMs)}, samples=${waitTooLongCoastHistoryMs.size}"
                     )
                 }
+                if (sendToStopCaptureMs in 60f..220f) {
+                    recordRecentWaitTooLongSendToStop(sendToStopCaptureMs)
+                    Log.d(
+                        TAG,
+                        "WTL_VARIANCE_GUARD_UPDATE: shotId=$shotId, observedSendToStopMs=${String.format("%.1f", sendToStopCaptureMs)}, recentMedian=${formatLearnedCoastMs(getRecentWaitTooLongSendToStopMedianMs())}, sampleCount=${recentWaitTooLongSendToStopMs.size}, recentSamples=${formatBoundarySendToStopHistory(recentWaitTooLongSendToStopMs)}"
+                    )
+                }
             }
         }
         Log.d(
@@ -918,8 +1136,33 @@ class ShotManager(
                 "decisionToFirstPostMs=$decisionToFirstPostLabel, " +
                 "sendToStopCaptureMs=${String.format("%.1f", sendToStopCaptureMs)}"
         )
+        if (policyLabel == "wait_too_long") {
+            val finalBiasPx = stopCursorX - trace.decisionTargetX
+            val absFinalBiasPx = abs(finalBiasPx)
+            val wtlOutlier = absFinalBiasPx >= 25
+            val wtlOutlierDirection =
+                when {
+                    !wtlOutlier -> "none"
+                    finalBiasPx < 0 -> "early"
+                    finalBiasPx > 0 -> "late"
+                    else -> "none"
+                }
+            val wtlOutlierReason =
+                when {
+                    sendToStopCaptureMs < 80f -> "send_to_stop_low"
+                    sendToStopCaptureMs > 150f -> "send_to_stop_high"
+                    decisionToFirstPostMs != null && decisionToFirstPostMs > 45f -> "first_post_late"
+                    sendOverheadForDiagMs.isFinite() && sendOverheadForDiagMs > 8f -> "send_overhead_high"
+                    abs(predictedStopErrorPx) >= 20 -> "predicted_error_high"
+                    else -> "unknown"
+                }
+            Log.d(
+                TAG,
+                "WTL_OUTLIER_DIAGNOSTIC: shotId=$shotId, finalBiasPx=$finalBiasPx, absFinalBiasPx=$absFinalBiasPx, wtlOutlier=$wtlOutlier, wtlOutlierDirection=$wtlOutlierDirection, wtlOutlierReason=$wtlOutlierReason, sendToStopCaptureMs=${String.format("%.1f", sendToStopCaptureMs)}, impliedLatencyMs=$impliedLatencyLabel, postReleaseDriftPx=$postReleaseDriftLabel, predictedStopX=$predictedStopXCurrentModel, finalStopX=$stopCursorX, predictedStopErrorPx=$predictedStopErrorPx, decisionToFirstPostMs=$decisionToFirstPostLabel, decisionFrameAgeMs=${formatOptionalMs(decisionFrameAgeMs)}, sendOverheadMs=${formatOptionalMs(sendOverheadForDiagMs)}, effectiveLatencyMs=${String.format("%.1f", trace.effectiveLatencyMs)}, recentWtlMedianSendToStopMs=${formatOptionalMs(trace.recentWtlMedianSendToStopMs)}, varianceCorrectionMs=${String.format("%.1f", trace.wtlVarianceCorrectionMs)}, coldStartFloorApplied=${trace.wtlColdStartFloorApplied}"
+            )
+        }
 
-        Log.d(TAG, "SHOT_END: shotId=$shotId, result=$verdict, inGreen=$inGreen, finalCursorX=$stopCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}, phaseWaitMs=${String.format("%.1f", trace.plannedWaitMs)}, effectiveLatencyMs=${String.format("%.1f", trace.effectiveLatencyMs)}, targetMode=${trace.targetMode}, phaseMode=$phaseMode, phaseSleepApplied=${trace.phaseSleepApplied}, policy=${trace.phasePolicy}, decisionGreen=${trace.decisionGreenLeft}..${trace.decisionGreenRight}, stopGreen=${stopGreenLeft}..${stopGreenRight}, scoringGreen=$scoringSource")
+        Log.d(TAG, "SHOT_END: shotId=$shotId, result=$verdict, inGreen=$inGreen, finalCursorX=$stopCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}, phaseWaitMs=${String.format("%.1f", trace.plannedWaitMs)}, effectiveLatencyMs=${String.format("%.1f", trace.effectiveLatencyMs)}, targetMode=${trace.targetMode}, phaseMode=$phaseMode, phaseSleepApplied=${trace.phaseSleepApplied}, policy=${trace.phasePolicy}, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}, decisionGreen=${trace.decisionGreenLeft}..${trace.decisionGreenRight}, stopGreen=${stopGreenLeft}..${stopGreenRight}, scoringGreen=$scoringSource")
         if (dupCount > 0) {
             Log.d(TAG, "Frame dedup: shotId=$shotId, skipped $dupCount duplicate frames")
         }
@@ -1020,6 +1263,16 @@ class ShotManager(
             )
         }
 
+    private fun getWaitTooLongPeriodMultiplier(): Float =
+        if (boundaryAlignedProbePlannerPreferBa) {
+            boundaryAlignedProbeWaitTooLongPeriodMultiplier
+        } else {
+            2.0f
+        }
+
+    private fun getWaitTooLongThresholdNs(): Long =
+        (frameClock.estimatedPeriodNs * getWaitTooLongPeriodMultiplier()).toLong()
+
     private fun evaluateBoundaryConfidenceGate(
         estimate: BoundaryBlendEstimate,
         pllStddevMs: Float
@@ -1033,9 +1286,11 @@ class ShotManager(
                 abs(estimate.frameRatio - 3.75f) < boundaryAlignedFrameBoundaryGuard
         val fastFloorActive =
             estimate.liveFastCoastMs > estimate.learnedFastCoastMs + 0.01f
+        val nearFrameBoundaryOverride =
+            boundaryAlignedProbePreferBa && pllStable && nearFrameBoundary
         val reasons = mutableListOf<String>()
         if (!pllStable) reasons += "pll_unstable"
-        if (nearFrameBoundary) reasons += "near_frame_boundary"
+        if (!boundaryAlignedProbePreferBa && nearFrameBoundary) reasons += "near_frame_boundary"
         val baAllowed = reasons.isEmpty()
         return BoundaryConfidenceGate(
             baAllowed = baAllowed,
@@ -1044,6 +1299,7 @@ class ShotManager(
             pllStddevMs = pllStddevMs,
             pllStable = pllStable,
             nearFrameBoundary = nearFrameBoundary,
+            nearFrameBoundaryOverride = nearFrameBoundaryOverride,
             fastFloorActive = fastFloorActive,
             fallbackPolicy = if (baAllowed) "boundary_aligned" else "wait_too_long"
         )
@@ -1145,6 +1401,20 @@ class ShotManager(
             recentBoundaryAlignedRealizedSendToStopMs.removeFirst()
         }
     }
+
+    private fun recordRecentWaitTooLongSendToStop(observedSendToStopMs: Float) {
+        recentWaitTooLongSendToStopMs.addLast(observedSendToStopMs)
+        while (recentWaitTooLongSendToStopMs.size > recentWaitTooLongSendToStopWindowSize) {
+            recentWaitTooLongSendToStopMs.removeFirst()
+        }
+    }
+
+    private fun getRecentWaitTooLongSendToStopMedianMs(): Float? =
+        if (recentWaitTooLongSendToStopMs.isEmpty()) {
+            null
+        } else {
+            computeMedian(recentWaitTooLongSendToStopMs.sorted())
+        }
 
     private fun recordShotEndSessionState(trace: ShotTrace, endNs: Long) {
         lastShotEndNs = endNs

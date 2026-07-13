@@ -82,19 +82,11 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
-        @Suppress("DEPRECATION")
-        val data = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
-        if (resultCode != 0 && data != null) {
-            val prefs = getSharedPreferences("calibration", Context.MODE_PRIVATE)
-            val region = CalibrationRepository(prefs).loadBarRegion()
-            if (region != null) {
-                screenCapture.start(resultCode, data, region)
-                Log.d(TAG, "Screen capture started, bar region: left=${region.left} top=${region.top} right=${region.right} bottom=${region.bottom}")
-            } else {
-                Log.w(TAG, "Screen capture NOT started — no bar region calibrated yet")
-            }
-        }
+        // Thin-trigger mode: the PC (shoot.py --serve) does all capture and timing.
+        // On-phone MediaProjection capture stays OFF — it was the thermal-throttle
+        // path that corrupted timing. The projection grant from MainActivity is
+        // accepted but deliberately unused.
+        Log.d(TAG, "OverlayService started (thin trigger — on-phone capture disabled)")
         return START_NOT_STICKY
     }
 
@@ -202,13 +194,13 @@ class OverlayService : Service() {
     }
 
     private fun onAutoTapped() {
+        // Thin trigger: this log line IS the trigger — pcshooter/shoot.py --serve
+        // streams logcat for it and fires the shot (capture + timing + release all
+        // on the PC). HTTP via adb reverse was rejected: Windows->WSL2 localhost
+        // forwarding is broken on the dev machine. Do not change the log text.
+        Log.d(TAG, "AUTO tapped — triggering PC shooter...")
         setButtonColor(Color.YELLOW)
-        Log.d(TAG, "AUTO tapped — shooting...")
-        shotManager.shoot { success ->
-            Log.d(TAG, "SHOT_COMPLETE: success=$success")
-            setButtonColor(if (success) Color.GREEN else Color.RED)
-            overlayView?.postDelayed({ setButtonColor(Color.GRAY) }, 500)
-        }
+        overlayView?.postDelayed({ setButtonColor(Color.GRAY) }, 600)
     }
 
     private fun setButtonColor(color: Int) {
