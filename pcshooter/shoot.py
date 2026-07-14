@@ -14,7 +14,7 @@ Modes:
 Timestamps: motion math uses encoder PTS (device clock, vsync-accurate);
 a min-offset clock bridge maps PTS -> PC monotonic for scheduling.
 """
-import argparse, json, pathlib, subprocess, sys, threading, time
+import argparse, itertools, json, pathlib, subprocess, sys, threading, time
 
 import av
 import cv2
@@ -37,6 +37,8 @@ MIN_SPEED_SAMPLES = 6   # 4 allowed a bad early fit (measured 0.68 vs true 0.44 
 FIT_LAST_N = 8          # speed fit window. 12 tested worse (pc-v11: |err| 7->14.5px):
                         # the sweep isn't constant-speed, long windows fit average
                         # speed, the release needs current speed. Don't raise this.
+FIT_MIN_SPAN_MS = 70.0  # six samples must cover several display frames; a burst of
+                        # duplicate/junk frames is not enough to predict a release
 NO_METER_ABORT_S = 0.8  # press -> no cursor/zone seen: game wasn't ready, abort + retry
                         # (was 1.5: meter shows <0.3s when it will; long hold just charges a dunk)
 BALL_FLIGHT_S = 1.8     # release -> shooter auto-catches; Pass is dead while ball is airborne
@@ -48,8 +50,18 @@ MAX_HOLD_S = 1.6        # never hold past this: over-holding keeps the ball in h
 CURSOR_MIN_BRIGHTNESS = 600   # of 765, from GreenZoneDetector.kt
 GREEN_MIN_RUN, GREEN_MAX_RUN, GREEN_MAX_GAP = 8, 60, 4
 MAX_STEP_PX = 35        # cursor moves ~10-20px/frame; bigger jump = detection glitch
-SPEED_BOUNDS = (0.15, 1.0)  # px/ms plausibility gate (observed true speed ~0.42-0.50)
+SPEED_BOUNDS = (0.15, 0.65)  # px/ms plausibility gate (observed true speed ~0.42-0.50)
+FIT_MAX_RESIDUAL_PX = 8.0    # reject a fit containing a brightness-argmax jump
 ZONE_STABLE_N = 3       # zone must be sighted this many times within +/-6px center
+AUTOCAL_WINDOW = 7      # rolling median of the last N measured_l_eff -> next l_eff.
+AUTOCAL_MIN = 3         # need this many measurements before overriding the seed.
+RELEASE_PHASE_MS = 6.0  # pc-v15: send this many ms before a display-frame boundary, so
+                        # the release (transport ~2ms) lands ~4ms ahead of the frame the
+                        # game samples it on — constant phase instead of 0..16.7ms random
+STREAM_WARMUP_FRAMES = 24  # a fresh screenrecord has a short burst of junk frames;
+                           # wait for a real current-stream window before shooting
+METER_MIN_DARK_FRACTION = 0.20
+METER_MIN_ACCENT_PIXELS = 8
 
 BLOB_DIR = "/data/local/tmp"
 DEBUG = False
@@ -64,8 +76,6 @@ def analyze_row(row):
     g = row[:, 1].astype(np.int32)
     b = row[:, 2].astype(np.int32)
     bright = r + g + b
-    cx = int(np.argmax(bright))
-    cursor = cx if bright[cx] > CURSOR_MIN_BRIGHTNESS else None
 
     # measured in-game zone color is dark green (46,106,66) — the Kotlin ratio test
     # (g/(r+b) > 1.3) misses it; green-dominant is sufficient against this bar's
@@ -75,6 +85,22 @@ def analyze_row(row):
     greenish[: int(0.05 * w)] = False
     greenish[int(0.95 * w):] = False
     zone = best_run(greenish)
+
+    # When the meter is absent, court lines and player graphics can be brighter
+    # than anything in this row.  Treating the global argmax as a cursor in that
+    # state arms a shot on a non-meter frame (the saved pc-v10 shot013 evidence
+    # showed exactly that).  The active meter has a black track plus orange/green
+    # accents, while the inactive court row does not.
+    dark = bright < 180
+    orangeish = (r >= 100) & (r > g + 25) & (r > b + 45) & (g >= 40)
+    meter_present = (float(dark.mean()) >= METER_MIN_DARK_FRACTION
+                     and (zone is not None
+                          or int(orangeish.sum()) >= METER_MIN_ACCENT_PIXELS))
+    if not meter_present:
+        return None, None
+
+    cx = int(np.argmax(bright))
+    cursor = cx if bright[cx] > CURSOR_MIN_BRIGHTNESS else None
     return cursor, zone
 
 
@@ -131,6 +157,9 @@ class Capture:
         self.lock = threading.Lock()
         self.alive = False
         self._proc = None
+        self._decode_thread = None
+        self._generation = 0         # prevents a killed decoder draining into a new stream
+        self._stream_frames = 0      # frames decoded by the current generation only
         self.last_rgb = None         # latest decoded frame (reference swap, no copy)
         self.last_arrival = 0.0      # monotonic time of the newest decoded frame
         self.t0 = 0.0                # when the current screenrecord process started
@@ -139,48 +168,97 @@ class Capture:
     def start(self):
         # kill any orphaned device-side screenrecord first (an interrupted session
         # can leave one holding the display -> new streams yield no frames)
+        # Invalidate the old generation before joining it.  Without this, PyAV can
+        # drain buffered frames from the killed process after the new process has
+        # started; those frames were able to pass the old ten-frame warmup gate.
+        with self.lock:
+            self._generation += 1
+            generation = self._generation
+            old_proc = self._proc
+            old_thread = self._decode_thread
+            self._proc = None
+            self._decode_thread = None
+            self.alive = False
+
+        if old_proc:
+            try:
+                old_proc.kill()
+            except ProcessLookupError:
+                pass
+        if old_thread and old_thread is not threading.current_thread():
+            old_thread.join(timeout=2.0)
+
         subprocess.run([ADB, "shell", "pkill", "-f", "screenrecord"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.clock = GridClock()     # fresh vsync anchor per stream
-        self.t0 = time.monotonic()
-        self._proc = subprocess.Popen(
+        proc = subprocess.Popen(
             [ADB, "exec-out", "screenrecord", "--output-format=h264",
              "--bit-rate", "8000000", "-"],
             # stdin MUST be detached: adb exec-out forwards inherited stdin to the
             # device and steals keystrokes from input() (--interactive double-Enter)
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self.alive = True
-        threading.Thread(target=self._decode, daemon=True).start()
+
+        with self.lock:
+            # Keep these values tied to the new generation.  In particular,
+            # last_arrival must not make ensure() believe a just-started stream is
+            # healthy while it is still waiting for its first frames.
+            self.clock = GridClock()
+            self.t0 = time.monotonic()
+            self._proc = proc
+            self._stream_frames = 0
+            self.last_rgb = None
+            self.last_arrival = 0.0
+            self.alive = True
+
+        thread = threading.Thread(target=self._decode,
+                                  args=(proc, generation), daemon=True)
+        with self.lock:
+            self._decode_thread = thread
+        thread.start()
 
     def ensure(self, max_age_s=150.0):
         """screenrecord hard-stops at 180s (pc-v5 shots 14-19: frozen frames).
         Restart the stream when frames are stale or it is older than max_age_s,
-        then block until the new stream has STABILIZED (10 decoded frames — the
-        first post-restart frames gave garbage shots: n_track=0, fake cursors).
+        then block until the new stream has STABILIZED (a current-generation
+        warmup window — the first post-restart frames gave garbage shots:
+        n_track=0, fake cursors).
         Thread-safe: serve mode calls this from watchdog + handler threads."""
         with self._ensure_lock:
             now = time.monotonic()
-            if now - self.last_arrival < 2.0 and now - self.t0 < max_age_s:
+            with self.lock:
+                last_arrival = self.last_arrival
+                t0 = self.t0
+                alive = self.alive
+                stream_frames = self._stream_frames
+            if (alive and last_arrival > 0 and now - last_arrival < 2.0
+                    and now - t0 < max_age_s
+                    and stream_frames >= STREAM_WARMUP_FRAMES):
                 return
             print(json.dumps({"event": "stream_restart",
-                              "stale_s": round(now - self.last_arrival, 1),
-                              "age_s": round(now - self.t0, 1)}))
-            if self._proc:
-                self._proc.kill()
-            n0 = len(self.samples)
+                              "stale_s": round(now - last_arrival, 1),
+                              "age_s": round(now - t0, 1)}), flush=True)
             self.start()
+            with self.lock:
+                generation = self._generation
             t_wait = time.monotonic()
-            while len(self.samples) - n0 < 10:
+            while True:
+                with self.lock:
+                    ready = (generation == self._generation
+                             and self.alive
+                             and self._stream_frames >= STREAM_WARMUP_FRAMES
+                             and self.last_arrival > 0)
+                if ready:
+                    return
                 if time.monotonic() - t_wait > 15:
                     raise RuntimeError("stream restart failed: no frames")
                 time.sleep(0.05)
 
-    def _decode(self):
+    def _decode(self, proc, generation):
         l, t, r, b = BAR
         mid = (t + b) // 2
+        clock = GridClock()        # one independent vsync anchor per generation
         try:
-            container = av.open(self._proc.stdout, format="h264", mode="r")
+            container = av.open(proc.stdout, format="h264", mode="r")
             for frame in container.decode(video=0):
                 arrival = time.monotonic()
                 rgb = frame.to_ndarray(format="rgb24")
@@ -188,7 +266,11 @@ class Capture:
                     break
                 cursor, zone = analyze_row(rgb[mid, l:r])
                 with self.lock:
-                    est_ms = self.clock.add(arrival * 1000)
+                    if generation != self._generation:
+                        return
+                    self.clock = clock   # publish: the vsync snap reads .anchor;
+                                         # start()'s placeholder never gets frames
+                    est_ms = clock.add(arrival * 1000)
                     self.samples.append((est_ms, arrival, cursor, zone))
                     # NEVER trim this list: take_shot tracks position by index, and
                     # a front-trim pins len() so consumers read [] forever (the
@@ -196,15 +278,30 @@ class Capture:
                     # of run time fit in a few MB.
                     self.last_rgb = rgb
                     self.last_arrival = arrival
+                    self._stream_frames += 1
         finally:
-            self.alive = False
+            with self.lock:
+                if generation == self._generation:
+                    self.alive = False
 
     def pts_to_wall(self, est_ms):
         return est_ms / 1000   # GridClock output is already wall-clock
 
     def stop(self):
-        if self._proc:
-            self._proc.kill()
+        with self.lock:
+            self._generation += 1
+            proc = self._proc
+            thread = self._decode_thread
+            self._proc = None
+            self._decode_thread = None
+            self.alive = False
+        if proc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
 
 
 # ---------- injection ----------
@@ -238,6 +335,9 @@ def device_rotation():
 
 
 class Injector:
+    # transport note: measured 2026-07-14, shell RTT jitter is ~2ms (p95 <5) on both
+    # adb.exe and native-adb/TCP — the per-shot latency variance is GAME-side frame
+    # processing, not transport. Don't chase transports again (pc-v14 rejected).
     def __init__(self):
         self.rot = 1                 # updated per shot from device_rotation()
         self.shell = subprocess.Popen([ADB, "shell", "su"], stdin=subprocess.PIPE,
@@ -293,8 +393,33 @@ def fit_speed(samples):
         return None
     t = np.array([s[0] for s in samples])
     x = np.array([s[1] for s in samples])
-    A = np.vstack([t - t[0], np.ones_like(t)]).T
-    speed, _ = np.linalg.lstsq(A, x, rcond=None)[0]
+    span = float(t[-1] - t[0])
+    if span < FIT_MIN_SPAN_MS or np.any(np.diff(t) <= 0):
+        return None
+
+    # A single bad brightness argmax can still pass the monotonic/step gates and
+    # badly tilt an ordinary least-squares fit.  The median of all pairwise
+    # slopes is robust to one such point; use it to identify inliers, then fit
+    # the current window normally so we retain the local sweep slope rather than
+    # replacing it with a heavily smoothed average.
+    slopes = []
+    for i in range(len(t) - 1):
+        dt = t[i + 1:] - t[i]
+        slopes.extend(((x[i + 1:] - x[i]) / dt).tolist())
+    robust_speed = float(np.median(slopes))
+    if not SPEED_BOUNDS[0] <= robust_speed <= SPEED_BOUNDS[1]:
+        return None
+
+    intercept = float(np.median(x - robust_speed * (t - t[0])))
+    residual = np.abs(x - (intercept + robust_speed * (t - t[0])))
+    inliers = residual <= FIT_MAX_RESIDUAL_PX
+    if int(inliers.sum()) < max(MIN_SPEED_SAMPLES - 1, 3):
+        return None
+
+    ti = t[inliers]
+    xi = x[inliers]
+    A = np.vstack([ti - ti[0], np.ones_like(ti)]).T
+    speed, _ = np.linalg.lstsq(A, xi, rcond=None)[0]
     return float(speed) if SPEED_BOUNDS[0] <= speed <= SPEED_BOUNDS[1] else None
 
 
@@ -320,6 +445,8 @@ def take_shot(cap, inj, l_eff_ms, fixed_hold_s=None, snaps=None, log=print):
     zones = []
     t_send = None
     x_at_send = speed = None
+    align_off_ms = None   # how far pc-v15 vsync alignment moved the send
+    rejects = 0
 
     seen_meter = False
     while time.monotonic() - t_press < SHOT_TIMEOUT_S:
@@ -346,13 +473,12 @@ def take_shot(cap, inj, l_eff_ms, fixed_hold_s=None, snaps=None, log=print):
                 continue
             # reject non-physical samples: cursor only moves right, in bounded steps
             if track and not (0 <= cursor - track[-1][1] <= MAX_STEP_PX * max(1, round((pts_ms - track[-1][0]) / 16.7))):
-                rejects = getattr(take_shot, "_rej", 0) + 1
-                take_shot._rej = rejects
+                rejects += 1
                 if rejects >= 3:
                     track.clear()   # detection lost the real cursor; start over
-                    take_shot._rej = 0
+                    rejects = 0
                 continue
-            take_shot._rej = 0
+            rejects = 0
             track.append((pts_ms, cursor))
 
         if fixed_hold_s is not None:
@@ -385,16 +511,23 @@ def take_shot(cap, inj, l_eff_ms, fixed_hold_s=None, snaps=None, log=print):
                 pts_last, x_last = track[-1]
                 wall_last = cap.pts_to_wall(pts_last)
                 t_send = wall_last + ((target - x_last) / speed - l_eff_ms) / 1000
+                with cap.lock:
+                    anchor = cap.clock.anchor
+                if anchor is not None:   # pc-v15 vsync-aligned release
+                    snapped = snap_to_grid(t_send, anchor)
+                    align_off_ms = round((snapped - t_send) * 1000, 1)
+                    t_send = snapped
                 now = time.monotonic()
                 if t_send <= now + 0.004:   # due (or overdue): send
-                    inj.release()
-                    t_send = now
-                    x_at_send = x_last + speed * (now - wall_last) * 1000
+                    t_release = inj.release()
+                    t_send = t_release
+                    x_at_send = x_last + speed * (t_release - wall_last) * 1000
                     break
                 elif t_send - now < 0.040:  # close: sleep precisely then send
                     time.sleep(max(0, t_send - time.monotonic()))
-                    inj.release()
-                    x_at_send = x_last + speed * (t_send - wall_last) * 1000
+                    t_release = inj.release()
+                    t_send = t_release
+                    x_at_send = x_last + speed * (t_release - wall_last) * 1000
                     break
         time.sleep(0.002)
     else:
@@ -429,12 +562,47 @@ def take_shot(cap, inj, l_eff_ms, fixed_hold_s=None, snaps=None, log=print):
             "timing": None if err is None else ("late" if err > 0 else "early"),
             "green": [gl, gr] if gl is not None else None,
             "speed_px_ms": speed, "x_at_send": x_at_send,
+            "align_off_ms": align_off_ms,
             "l_eff_used": l_eff_ms if fixed_hold_s is None else None,
             "measured_l_eff": (None if (rest is None or x_at_send is None or not speed)
                                else round((rest - x_at_send) / speed, 1)),
             "n_track": len(track),
             "debug_track": [(round(t, 1), x) for t, x in track] if DEBUG else None,
             "debug_zones": zones[-10:] if DEBUG else None}
+
+
+class AutoCal:
+    """Per-session l_eff tracker: rolling median of recent measured latencies.
+    Removes both the session-to-session offset (84 vs 96 vs 118 across days) and
+    the within-session drift (+25ms/20 shots) without hand-set flags. Median over
+    a window is robust to the 180ms frame-drop outliers — unlike the pc-v12-rejected
+    per-shot gain-0.5 controller, which amplified that same noise."""
+
+    def __init__(self, seed, clamp=(40.0, 250.0)):
+        self.seed = float(seed)
+        self.lo, self.hi = clamp
+        self.hist = []
+
+    def l_eff(self):
+        if len(self.hist) < AUTOCAL_MIN:
+            return self.seed
+        med = float(np.median(self.hist[-AUTOCAL_WINDOW:]))
+        return min(self.hi, max(self.lo, med))
+
+    def update(self, measured):
+        if measured is not None:
+            self.hist.append(float(measured))
+
+
+def snap_to_grid(t_send_s, anchor_ms, phase_ms=RELEASE_PHASE_MS, v_ms=GridClock.V):
+    """Snap a send time (monotonic s) to `phase_ms` before the nearest display-frame
+    boundary (grid: anchor_ms + n*v_ms, in monotonic ms). The game consumes input on
+    its render frames; a constant send phase turns the 0..16.7ms sampling delay into
+    a constant absorbed by l_eff, and the snap (<= +-v/2) picks the frame whose
+    landing is nearest the target."""
+    t_ms = t_send_s * 1000
+    k = round((t_ms + phase_ms - anchor_ms) / v_ms)
+    return (anchor_ms + k * v_ms - phase_ms) / 1000
 
 
 def _extrapolate_now(track, speed, cap):
@@ -505,7 +673,7 @@ def wait_shootable(cap, inj, timeout_s=12.0):
     return None
 
 
-def serve(cap, inj, l_eff, logf, label):
+def serve(cap, inj, l_eff, logf, label, cal=None):
     """Phone-button trigger via logcat: the app logs 'AUTO tapped' on every tap;
     we stream `adb logcat` and fire one shot per tap line. Chosen over HTTP +
     adb reverse because Windows->WSL2 localhost forwarding is broken on this
@@ -544,7 +712,10 @@ def serve(cap, inj, l_eff, logf, label):
         with busy:
             inj.rot = device_rotation()
             cap.ensure()
-            res = take_shot(cap, inj, l_eff)
+            res = take_shot(cap, inj, cal.l_eff() if cal else l_eff)
+            if cal:
+                cal.update(res.get("measured_l_eff"))
+                res["l_eff_auto"] = round(cal.l_eff(), 1)
             res.update(shot=n, label=label, mode="serve")
             n += 1
             out = json.dumps(res)
@@ -558,21 +729,33 @@ def serve(cap, inj, l_eff, logf, label):
 
 # ---------- main ----------
 
+def shot_indices(shots, interactive):
+    """Return the shot-number iterator for the selected run mode.
+
+    Interactive runs are deliberately unbounded: ``--shots`` is retained for
+    command compatibility, but only applies to non-interactive batch runs.
+    """
+    return itertools.count() if interactive else range(shots)
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--shots", type=int, default=1)
+    ap.add_argument("--shots", type=int, default=1,
+                    help="number of shots in batch mode (ignored with --interactive)")
     ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--label", default="pc-v1")
     ap.add_argument("--l-eff", type=float, default=L_EFF_MS)
     ap.add_argument("--adapt", action="store_true",
                     help="adjust l_eff each shot from landing error (feedback controller)")
+    ap.add_argument("--no-autocal", action="store_false", dest="autocal",
+                    help="disable per-session l_eff auto-calibration (rolling median "
+                         "of measured latency); use the fixed --l-eff instead")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--serve", action="store_true",
                     help="phone-button trigger mode: stream logcat and fire one shot "
                          "per overlay AUTO tap (trigger travels over adb, no network)")
     ap.add_argument("--interactive", action="store_true",
-                    help="wait for Enter before each shot and never auto-pass — "
-                         "you position the play, the script only times the release")
+                    help="wait for Enter before each shot and run until Ctrl+C; "
+                         "never auto-pass (ignores --shots)")
     ap.add_argument("--save-frames", action="store_true",
                     help="save key stream frames per shot (press/armed/release/rest) — "
                          "frames come from the existing stream, zero extra phone load")
@@ -588,7 +771,12 @@ def main():
     cap, inj = Capture(), Injector()
     cap.start()
     t0 = time.monotonic()
-    while not cap.samples:
+    while True:
+        with cap.lock:
+            ready = (bool(cap.samples) and cap.alive
+                     and cap._stream_frames >= STREAM_WARMUP_FRAMES)
+        if ready:
+            break
         if time.monotonic() - t0 > 15:
             # don't die: screen may be off/locked, or the device needs a moment —
             # keep retrying so --serve can be started before picking up the phone
@@ -601,21 +789,24 @@ def main():
 
     measured = []
     l_eff = args.l_eff
+    # autocal off when the experimental per-shot --adapt controller is requested
+    cal = AutoCal(args.l_eff) if (args.autocal and not args.adapt) else None
     try:
         if args.serve:
-            try:
-                serve(cap, inj, l_eff, logf, args.label)
-            except KeyboardInterrupt:
-                pass
+            serve(cap, inj, args.l_eff, logf, args.label, cal=cal)
             return
-        for i in range(args.shots):
+        for i in shot_indices(args.shots, args.interactive):
             snaps = {} if args.save_frames else None
             if args.interactive:
                 # refresh an aging stream NOW, while we're idle at the prompt —
-                # restarting after Enter fired shots into an unstable fresh stream
+                # restarting after Enter fired shots into an unstable fresh stream.
+                # (pc-v16 tried encoder-off-while-idle for thermal relief: latency
+                # still drifted +25ms within 20 shots — the drift is game-side,
+                # so we keep the stream warm and keep Enter->press instant.)
                 cap.ensure(max_age_s=60)
                 input(f"[shot {i}] position the play, Enter to shoot... ")
             inj.rot = device_rotation()   # user may rotate between shots (~0.3s, off timing path)
+            l_eff = cal.l_eff() if cal else args.l_eff
             # interactive: one attempt, no auto-pass — never fight the user's hands
             for attempt in range(1 if args.interactive else 5):
                 if args.interactive:
@@ -628,6 +819,9 @@ def main():
                 res["handler_x"] = round(handler[0]) if handler else None
                 if res.get("reason") != "no_meter":
                     break
+            if cal:
+                cal.update(res.get("measured_l_eff"))
+                res["l_eff_auto"] = round(cal.l_eff(), 1)
             if (args.adapt and res.get("rest_x") is not None and res.get("green")
                     and res.get("speed_px_ms")):
                 gl, gr = res["green"]
@@ -651,6 +845,8 @@ def main():
             # no blind post-shot reset: the next shot's wait_shootable watches the
             # handler label and passes the ball off the rim only when needed
             time.sleep(1.5)   # let game settle between shots
+    except KeyboardInterrupt:
+        print("\nstopped by Ctrl+C", flush=True)
     finally:
         inj.release()        # belt & braces
         inj.close()

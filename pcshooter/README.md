@@ -29,8 +29,13 @@ coords are the `SHOOT_POS` / `PASS_POS` constants in shoot.py.
 ```bash
 .venv/bin/python shoot.py --calibrate --shots 5          # measure L_eff (sacrificial shots)
 .venv/bin/python shoot.py --shots 20 --label <cfg> --adapt --save-frames
+.venv/bin/python shoot.py --shots 20 --interactive --label pc-v17  # keep shooting; Ctrl+C to stop
 .venv/bin/python test_shoot.py                           # logic self-checks (no device)
 ```
+
+`--interactive` is an unbounded practice mode. It waits for Enter before every
+shot, ignores `--shots`, and exits cleanly only when you press Ctrl+C. Without
+`--interactive`, `--shots N` remains a finite batch run.
 
 Game must be in a **free-play mode** — the practice tutorial gates buttons stage-by-stage
 and breaks volume runs. Per-shot JSONL logs land in `logs/<label>.jsonl`;

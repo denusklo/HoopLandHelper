@@ -20,6 +20,13 @@ def test_analyze_row():
     cursor, zone = shoot.analyze_row(row)
     assert cursor is None
 
+    # A bright court line in the same screen row must not masquerade as a
+    # cursor when the shooting meter is absent.
+    inactive = np.full((w, 3), (180, 120, 70), np.uint8)  # court-colored background
+    inactive[300] = (255, 255, 255)     # unrelated bright line
+    cursor, zone = shoot.analyze_row(inactive)
+    assert cursor is None and zone is None
+
 
 def test_best_run_gap_merge_and_bounds():
     mask = np.zeros(100, bool)
@@ -61,6 +68,49 @@ def test_fit_speed_bounds():
     crazy = [(ti, 100 + 3.0 * ti) for ti in t]              # 3 px/ms: out of bounds
     assert shoot.fit_speed(crazy) is None
     assert shoot.fit_speed(good[:3]) is None                # below MIN_SPEED_SAMPLES
+
+    # One monotonic but bogus argmax must not tilt the fit.
+    contaminated = good.copy()
+    contaminated[3] = (contaminated[3][0], contaminated[3][1] + 20)
+    assert abs(shoot.fit_speed(contaminated) - 0.45) < 0.01
+
+
+def test_autocal():
+    c = shoot.AutoCal(seed=96.0)
+    assert c.l_eff() == 96.0                       # seed until AUTOCAL_MIN samples
+    c.update(100); c.update(110)
+    assert c.l_eff() == 96.0                        # still < min
+    c.update(120)
+    assert c.l_eff() == 110.0                       # median(100,110,120)
+    # a single frame-drop outlier must not swing the median much
+    c.update(400)
+    assert 105 <= c.l_eff() <= 120, c.l_eff()
+    # None (blind/no-meter shot) is ignored
+    before = c.l_eff()
+    c.update(None)
+    assert c.l_eff() == before
+    # clamp holds
+    c2 = shoot.AutoCal(seed=96.0, clamp=(40, 130))
+    for v in (300, 300, 300):
+        c2.update(v)
+    assert c2.l_eff() == 130.0
+
+
+def test_snap_to_grid():
+    v = shoot.GridClock.V
+    anchor = 5000.0
+    # any raw send snaps to exactly phase_ms before some boundary, moving <= v/2
+    for raw_ms in (5100.0, 5103.3, 5108.9, 5111.11, 5116.6):
+        snapped = shoot.snap_to_grid(raw_ms / 1000, anchor, phase_ms=6.0) * 1000
+        assert abs(snapped - raw_ms) <= v / 2 + 1e-9, (raw_ms, snapped)
+        rem = (snapped + 6.0 - anchor) % v
+        assert min(rem, v - rem) < 1e-6, (raw_ms, snapped, rem)
+
+
+def test_shot_indices():
+    assert list(shoot.shot_indices(3, interactive=False)) == [0, 1, 2]
+    infinite = shoot.shot_indices(20, interactive=True)
+    assert [next(infinite) for _ in range(4)] == [0, 1, 2, 3]
 
 
 def test_capture_samples_never_trimmed():
