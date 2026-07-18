@@ -1,11 +1,23 @@
 package com.denusklo.hooplandhelper.core
 
-import android.util.Log
 import com.denusklo.hooplandhelper.data.CalibrationRepository
 import kotlinx.coroutines.*
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+// File-private logger. The per-shot timing model emits ~50 trace lines per shot (many
+// per frame at 60fps) — logcat I/O that burns power in the hot loop. Shadowing
+// android.util.Log gates all existing Log.d(TAG,…) calls behind VERBOSE with zero
+// call-site changes; the shot-outcome summary uses Log.i so a normal run still prints
+// SHOT_START / DETECTED / SHOT_END. Flip VERBOSE=true to restore the full trace.
+private const val VERBOSE = false
+private object Log {
+    fun d(tag: String, msg: String) { if (VERBOSE) android.util.Log.d(tag, msg) }
+    fun i(tag: String, msg: String) { android.util.Log.i(tag, msg) }
+    fun e(tag: String, msg: String) { android.util.Log.e(tag, msg) }
+    fun w(tag: String, msg: String) { android.util.Log.w(tag, msg) }
+}
 
 typealias FrameProvider = () -> BarFrame?
 
@@ -194,11 +206,11 @@ class ShotManager(
 
     fun shoot(onResult: (Boolean) -> Unit) {
         if (!calibration.isCalibrated()) {
-            Log.d(TAG, "shoot() called but not calibrated")
+            Log.i(TAG, "shoot() called but not calibrated")
             onResult(false); return
         }
         if (isRunning) {
-            Log.d(TAG, "shoot() called but already running, ignoring")
+            Log.i(TAG, "shoot() called but already running, ignoring")
             return
         }
         isRunning = true
@@ -219,7 +231,7 @@ class ShotManager(
             targetMode = "greenLeft"
         )
 
-        Log.d(TAG, "SHOT_START: shotId=$shotId, mode=fixed, fixedLatencyMs=${releaseLatencyMs}, phaseMode=$phaseMode, targetMode=${trace.targetMode}, holdStartNs=${trace.holdStartNs}")
+        Log.i(TAG, "SHOT_START: shotId=$shotId, mode=fixed, fixedLatencyMs=${releaseLatencyMs}, phaseMode=$phaseMode, targetMode=${trace.targetMode}, holdStartNs=${trace.holdStartNs}")
         Log.d(
             TAG,
             "TIMING_MODEL_CONFIG: shotId=$shotId, baCorrectionFrames=${String.format("%.3f", boundaryAlignedPostQuantizationCorrectionFrames)}, baQuantizer=$boundaryAlignedQuantizerLabel, baGate=$boundaryAlignedGateLabel, baEnvelopeGate=$boundaryAlignedProbeEnvelopeGate, baMinPlannedWaitMs=${String.format("%.1f", boundaryAlignedMinPlannedWaitMs)}, baRequireShadowRightEdge=$boundaryAlignedRequireShadowRightEdge, baMinRemainingPx=$boundaryAlignedMinRemainingPx, baMaxEffectiveLatencyMs=${String.format("%.1f", boundaryAlignedMaxEffectiveLatencyMs)}, plannerPreferBa=$boundaryAlignedProbePlannerPreferBa, waitTooLongPeriodMultiplier=${String.format("%.1f", getWaitTooLongPeriodMultiplier())}, wtlCapMs=${String.format("%.1f", waitTooLongCoastMaxMs)}, baWindowLeftOffsetPx=$boundaryAlignedReleaseWindowLeftOffsetPx, baWindowRightMarginPx=$boundaryAlignedReleaseWindowRightMarginPx, wtlWindowLeftOffsetPx=$waitTooLongReleaseWindowLeftOffsetPx, wtlWindowRightMarginPx=$waitTooLongReleaseWindowRightMarginPx"
@@ -309,12 +321,16 @@ class ShotManager(
                             lastUniqueCaptureNs = frame.timestampNs
                             lastObserveNs = nowNano
                             val timeFromHoldStartMs = (nowNano - trace.holdStartNs) / 1_000_000L
-                            Log.d(TAG, "DETECTED: cursor=${analysis.cursorX}, green=${analysis.greenLeft}..${analysis.greenRight}, holdStart=${timeFromHoldStartMs}ms, frame #$frameCount, frameSeq=${frame.frameSeq}")
+                            Log.i(TAG, "DETECTED: cursor=${analysis.cursorX}, green=${analysis.greenLeft}..${analysis.greenRight}, holdStart=${timeFromHoldStartMs}ms, frame #$frameCount, frameSeq=${frame.frameSeq}")
                         }
 
-                        // Update target every frame — aim at green zone LEFT edge
-                        if (analysis.greenLeft != targetX) {
-                            targetX = analysis.greenLeft
+                        // Update target every frame. Real green zone: aim the LEFT edge
+                        // (small ~16px zone; left edge gives margin against overshoot coast).
+                        // Orange fallback (no green): aim the CENTER of the wide ~127px band
+                        // — max margin both sides, the whole point of the fallback.
+                        val aimX = if (analysis.isOrangeFallback) analysis.greenCenter else analysis.greenLeft
+                        if (aimX != targetX) {
+                            targetX = aimX
                         }
                         trace.lastGreenLeft = analysis.greenLeft
                         trace.lastGreenRight = analysis.greenRight
@@ -507,8 +523,14 @@ class ShotManager(
                                     else -> releaseLatencyMs.toFloat()
                                 }
                                 releaseWindowOffsets = getReleaseWindowOffsets(livePolicy)
+                                // Release fires when predictedStopX >= releaseWindowLeft (see below).
+                                // Real green zone: anchor at greenLeft (aim the small zone's left edge).
+                                // Orange fallback (no green): anchor at the band CENTER (targetX) — else
+                                // it fires the instant predicted-stop crosses the band's LEFT edge,
+                                // landing the cursor at the start of the orange instead of its middle.
                                 releaseWindowLeft =
-                                    analysis.greenLeft + releaseWindowOffsets.leftOffsetPx
+                                    if (analysis.isOrangeFallback) targetX + releaseWindowOffsets.leftOffsetPx
+                                    else analysis.greenLeft + releaseWindowOffsets.leftOffsetPx
                                 releaseWindowRight =
                                     analysis.greenRight - releaseWindowOffsets.rightMarginPx
                                 predictedStopX =
@@ -734,7 +756,7 @@ class ShotManager(
                     sawGreen && !armed -> "green_seen_not_stable"
                     else -> "cursor_and_green_never_armed"
                 }
-            Log.d(TAG, "SHOT_END: shotId=$shotId, result=TIMEOUT, timeoutReason=$timeoutReason, sawCursor=$sawCursor, framesWithCursor=$framesWithCursor, maxCursorXSeen=$maxCursorXSeen, framesWithGreenAccepted=$framesWithGreenAccepted, lastCursorX=$lastCursorX, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}")
+            Log.i(TAG, "SHOT_END: shotId=$shotId, result=TIMEOUT, timeoutReason=$timeoutReason, sawCursor=$sawCursor, framesWithCursor=$framesWithCursor, maxCursorXSeen=$maxCursorXSeen, framesWithGreenAccepted=$framesWithGreenAccepted, lastCursorX=$lastCursorX, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}")
             recordShotEndSessionState(trace, System.nanoTime())
             touchInjector.release()
             isRunning = false
@@ -892,7 +914,7 @@ class ShotManager(
 
         // Exhausted polls without stable stop
         trace.result = "POLL_EXPIRED"
-        Log.d(TAG, "SHOT_END: shotId=$shotId, result=${trace.result}, inGreen=false, finalCursorX=$lastPostCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}")
+        Log.i(TAG, "SHOT_END: shotId=$shotId, result=${trace.result}, inGreen=false, finalCursorX=$lastPostCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}")
         recordShotEndSessionState(trace, System.nanoTime())
     }
 
@@ -1162,7 +1184,7 @@ class ShotManager(
             )
         }
 
-        Log.d(TAG, "SHOT_END: shotId=$shotId, result=$verdict, inGreen=$inGreen, finalCursorX=$stopCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}, phaseWaitMs=${String.format("%.1f", trace.plannedWaitMs)}, effectiveLatencyMs=${String.format("%.1f", trace.effectiveLatencyMs)}, targetMode=${trace.targetMode}, phaseMode=$phaseMode, phaseSleepApplied=${trace.phaseSleepApplied}, policy=${trace.phasePolicy}, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}, decisionGreen=${trace.decisionGreenLeft}..${trace.decisionGreenRight}, stopGreen=${stopGreenLeft}..${stopGreenRight}, scoringGreen=$scoringSource")
+        Log.i(TAG, "SHOT_END: shotId=$shotId, result=$verdict, inGreen=$inGreen, finalCursorX=$stopCursorX, decisionCursorX=${trace.decisionCursorX}, targetX=${trace.decisionTargetX}, phaseWaitMs=${String.format("%.1f", trace.plannedWaitMs)}, effectiveLatencyMs=${String.format("%.1f", trace.effectiveLatencyMs)}, targetMode=${trace.targetMode}, phaseMode=$phaseMode, phaseSleepApplied=${trace.phaseSleepApplied}, policy=${trace.phasePolicy}, fallbackFromBaEnvelope=${trace.fallbackFromBaEnvelope}, fallbackFromBaCloseRange=${trace.fallbackFromBaCloseRange}, fallbackFromBaEffectiveLatency=${trace.fallbackFromBaEffectiveLatency}, baFallbackReason=${trace.baFallbackReason}, decisionGreen=${trace.decisionGreenLeft}..${trace.decisionGreenRight}, stopGreen=${stopGreenLeft}..${stopGreenRight}, scoringGreen=$scoringSource")
         if (dupCount > 0) {
             Log.d(TAG, "Frame dedup: shotId=$shotId, skipped $dupCount duplicate frames")
         }

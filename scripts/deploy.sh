@@ -2,6 +2,9 @@
 # Build, install APK, and stream logs — all from WSL2
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
 ADB="adb.exe"
 APK="app/build/outputs/apk/debug/app-debug.apk"
 WIN_APK="C:\\Projects\\HoopLandHelper\\HoopLandHelper-v1.0-debug.apk"

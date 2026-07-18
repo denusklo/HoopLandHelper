@@ -4,7 +4,7 @@
 Setup:
 1. Connect ADB over WiFi:  adb connect <phone_ip>:5555
 2. Set up reverse port:    adb reverse tcp:9999 tcp:9999
-3. Run this script:         python relay.py
+3. From the repo root, run: python scripts/relay.py
 """
 
 import socket

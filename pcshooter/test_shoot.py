@@ -28,6 +28,32 @@ def test_analyze_row():
     assert cursor is None and zone is None
 
 
+def test_analyze_row_orange_fallback():
+    w = 463
+    # Hard shot: orange-only meter, no green segment -> aim the wide orange band.
+    row = np.zeros((w, 3), np.uint8)
+    row[140:266] = (229, 112, 40)                          # 126px orange band, no green
+    row[300] = (255, 255, 255)                             # white cursor
+    cursor, zone = shoot.analyze_row(row)
+    assert cursor == 300, cursor
+    assert zone is not None and 140 <= zone[0] <= 145 and 260 <= zone[1] <= 266, zone
+    assert zone[1] - zone[0] > shoot.GREEN_MAX_RUN, zone   # wide band, not a green run
+
+    # Green present -> green still wins (orange flanks are not the target).
+    row = np.zeros((w, 3), np.uint8)
+    row[140:205] = (229, 112, 40)                          # left orange flank
+    row[205:235] = (46, 106, 66)                           # green sweet-spot
+    row[235:270] = (229, 112, 40)                          # right orange flank
+    row[300] = (255, 255, 255)
+    _, zone = shoot.analyze_row(row)
+    assert zone == (205, 234), zone
+
+    # Court-floor bleed (full-width orange) must not become a target zone.
+    floor = np.full((w, 3), (200, 150, 90), np.uint8)
+    cursor, zone = shoot.analyze_row(floor)
+    assert zone is None, zone
+
+
 def test_best_run_gap_merge_and_bounds():
     mask = np.zeros(100, bool)
     mask[10:20] = True; mask[22:30] = True                 # gap 2 <= 4: merged

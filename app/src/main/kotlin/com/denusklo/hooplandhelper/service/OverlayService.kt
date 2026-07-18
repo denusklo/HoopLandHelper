@@ -41,6 +41,7 @@ class OverlayService : Service() {
     private lateinit var windowManager: WindowManager
     private lateinit var shotManager: ShotManager
     private lateinit var screenCapture: ScreenCaptureService
+    private val fridaAimAssist by lazy { FridaAimAssist(this) }
 
     // AUTO button overlay
     private var overlayView: View? = null
@@ -78,15 +79,25 @@ class OverlayService : Service() {
         startForeground(1, buildNotification())
         setupShotManager()
         showAutoButton()
+        fridaAimAssist.start()   // on-device aim-assist: inject the il2cpp hook, keep it attached
         Log.d(TAG, "OverlayService created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Thin-trigger mode: the PC (shoot.py --serve) does all capture and timing.
-        // On-phone MediaProjection capture stays OFF — it was the thermal-throttle
-        // path that corrupted timing. The projection grant from MainActivity is
-        // accepted but deliberately unused.
-        Log.d(TAG, "OverlayService started (thin trigger — on-phone capture disabled)")
+        // On-phone path: start MediaProjection capture so ShotManager can see the meter.
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
+        @Suppress("DEPRECATION")
+        val data = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        if (resultCode != 0 && data != null) {
+            val prefs = getSharedPreferences("calibration", Context.MODE_PRIVATE)
+            val region = CalibrationRepository(prefs).loadBarRegion()
+            if (region != null) {
+                screenCapture.start(resultCode, data, region)
+                Log.d(TAG, "Screen capture started, bar region: left=${region.left} top=${region.top} right=${region.right} bottom=${region.bottom}")
+            } else {
+                Log.w(TAG, "Screen capture NOT started — no bar region calibrated yet")
+            }
+        }
         return START_NOT_STICKY
     }
 
@@ -100,7 +111,7 @@ class OverlayService : Service() {
         val relayLatency = if (isRooted) 100L else 250L  // ms: fixed sendevent latency (instrumentation baseline)
         Log.d(TAG, "Root check: isRooted=$isRooted, latency=${relayLatency}ms")
 
-        // ADB relay for non-root touch injection (requires: adb reverse tcp:9999 tcp:9999 + relay.py on host)
+        // ADB relay for non-root touch injection (requires: adb reverse tcp:9999 tcp:9999 + scripts/relay.py on host)
         val relay = AdbRelayClient()
 
         // Display info for sendevent coordinate mapping
@@ -194,13 +205,14 @@ class OverlayService : Service() {
     }
 
     private fun onAutoTapped() {
-        // Thin trigger: this log line IS the trigger — pcshooter/shoot.py --serve
-        // streams logcat for it and fires the shot (capture + timing + release all
-        // on the PC). HTTP via adb reverse was rejected: Windows->WSL2 localhost
-        // forwarding is broken on the dev machine. Do not change the log text.
-        Log.d(TAG, "AUTO tapped — triggering PC shooter...")
+        // On-phone path: ShotManager captures the meter, times, and releases locally.
         setButtonColor(Color.YELLOW)
-        overlayView?.postDelayed({ setButtonColor(Color.GRAY) }, 600)
+        Log.d(TAG, "AUTO tapped — shooting...")
+        shotManager.shoot { success ->
+            Log.d(TAG, "SHOT_COMPLETE: success=$success")
+            setButtonColor(if (success) Color.GREEN else Color.RED)
+            overlayView?.postDelayed({ setButtonColor(Color.GRAY) }, 500)
+        }
     }
 
     private fun setButtonColor(color: Int) {
@@ -234,7 +246,6 @@ class OverlayService : Service() {
             Log.d(TAG, "Bar rect: no frame available, skipping overlay")
             return
         }
-        saveCalibrationBarRegionPreview(region, frame)
         val (w, h, getPixel) = Triple(frame.width, frame.height, frame.getPixel)
         var totalBrightness = 0
         var samples = 0
@@ -274,57 +285,6 @@ class OverlayService : Service() {
         windowManager.addView(rectView, params)
         barRectView = rectView
         Log.d(TAG, "Bar rect overlay shown at (${region.left},${region.top}) ${width}x${height}")
-    }
-
-    private fun saveCalibrationBarRegionPreview(region: BarRegion, frame: BarFrame) {
-        Thread {
-            try {
-                val debugRoot = getExternalFilesDir(null) ?: return@Thread
-                val dir = File(debugRoot, "debug")
-                if (!dir.exists()) dir.mkdirs()
-
-                val width = frame.width
-                val height = frame.height
-                if (width <= 0 || height <= 0) return@Thread
-
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                var brightnessSum = 0L
-
-                for (y in 0 until height) {
-                    for (x in 0 until width) {
-                        val pixel = frame.getPixel(x, y)
-                        bitmap.setPixel(x, y, pixel)
-                        brightnessSum += brightnessOf(pixel).toLong()
-                    }
-                }
-
-                val avgBrightness = brightnessSum.toDouble() / (width * height).toDouble()
-                val file = File(dir, "calibration_bar_region_preview.png")
-                file.outputStream().use { fos ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
-                }
-                bitmap.recycle()
-
-                Log.d(
-                    TAG,
-                    "CALIBRATION_BAR_REGION_CHECK: display=(${region.left},${region.top},${region.right},${region.bottom}), " +
-                        "roiSize=${width}x${height}, avgBrightness=${String.format(Locale.US, "%.1f", avgBrightness)}"
-                )
-                Log.d(
-                    TAG,
-                    "CALIBRATION_BAR_REGION_PREVIEW: file=${file.absolutePath}, size=${width}x${height}"
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "CALIBRATION_BAR_REGION_PREVIEW_FAILED: ${e.message}")
-            }
-        }.start()
-    }
-
-    private fun brightnessOf(pixel: Int): Int {
-        val r = (pixel shr 16) and 0xFF
-        val g = (pixel shr 8) and 0xFF
-        val b = pixel and 0xFF
-        return (299 * r + 587 * g + 114 * b) / 1000
     }
 
     private fun removeBarRectOverlay() {
@@ -632,7 +592,14 @@ class OverlayService : Service() {
 
     // --- LIFECYCLE --------------------------------------------------------------
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // swipe-away from recents doesn't reliably call onDestroy — stop aim-assist here
+        fridaAimAssist.stop()
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
+        fridaAimAssist.stop()
         screenCapture.stop()
         removeBarRectOverlay()
         overlayView?.let { windowManager.removeView(it) }

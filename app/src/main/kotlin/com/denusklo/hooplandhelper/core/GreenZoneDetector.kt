@@ -10,7 +10,9 @@ class GreenZoneDetector(
     private val debugDir: String? = null
 ) {
 
-    private var frameDumpCount = 0
+    // Per-frame detection logs are power-hungry (string build every frame at ~60fps).
+    // Off by default; flip to true only when diagnosing detection. See dbg().
+    private inline fun dbg(msg: () -> String) { if (DEBUG) Log.d(TAG, msg()) }
 
     // Pending candidate — must stabilise 2 consecutive valid-width frames before promotion
     private var pendingGreenLeft = -1
@@ -42,11 +44,22 @@ class GreenZoneDetector(
     /** Width range considered plausible for the real meter green zone. */
     private val PLAUSIBLE_WIDTH_RANGE = 6..40
     private val OVERSIZE_FALLBACK_LIMIT = 5
+    // Orange-band fallback bounds (px on the calibrated bar, ~same width as pcshooter's
+    // 463px BAR): band = orange+green+orange ~126px, so cap 200 rejects full-width court
+    // bleed; min 16 rejects noise; gap 8 bridges anti-aliasing. ponytail: tune only if a
+    // real orange band falls outside these on device.
+    private val ORANGE_MIN_RUN = 16
+    private val ORANGE_MAX_RUN = 200
+    private val ORANGE_MAX_GAP = 8
 
     data class BarAnalysis(
         val cursorX: Int,
         val greenLeft: Int,
-        val greenRight: Int
+        val greenRight: Int,
+        /** true when greenLeft/Right describe the wider orange band, not a real green
+         * zone (hard/contested shots have no green sweet-spot). Aiming its center is
+         * far more forgiving. Callers treat the zone the same either way. */
+        val isOrangeFallback: Boolean = false
     ) {
         val greenCenter: Int get() = (greenLeft + greenRight) / 2
         val greenWidth: Int get() = greenRight - greenLeft
@@ -71,12 +84,6 @@ class GreenZoneDetector(
      */
     fun analyzeBar(width: Int, height: Int, getPixel: (Int, Int) -> Int): BarAnalysis {
         val midY = height / 2
-
-        // Debug PNG saving disabled to reduce thermal load during gameplay
-        // if (frameDumpCount < 1 && debugDir != null) {
-        //     saveDebugPng(width, height, getPixel, frameDumpCount)
-        //     frameDumpCount++
-        // }
 
         // Find cursor (brightest pixel) and collect all green segments in one pass
         var maxBrightness = 0
@@ -134,7 +141,7 @@ class GreenZoneDetector(
         if (segments.size != mergedSegments.size) {
             val rawDesc = segments.joinToString(", ") { "${it.left}..${it.right}(${it.width})" }
             val mergedDesc = mergedSegments.joinToString(", ") { "${it.left}..${it.right}(${it.width})" }
-            Log.d(TAG, "GREEN_MERGED: raw=[$rawDesc], merged=[$mergedDesc]")
+            dbg { "GREEN_MERGED: raw=[$rawDesc], merged=[$mergedDesc]" }
         }
 
         // --- Pre-cursor band update ---
@@ -158,7 +165,7 @@ class GreenZoneDetector(
             preCursorBandLeft = -1
             preCursorBandRight = -1
             preCursorBandFrames = 0
-            Log.d(TAG, "GREEN_PRECURSOR_BAND_EXPIRED: reason=current_support_lost")
+            dbg { "GREEN_PRECURSOR_BAND_EXPIRED: reason=current_support_lost" }
         }
         if (earlyPhase) {
             val prevLeft = preCursorBandLeft
@@ -179,14 +186,14 @@ class GreenZoneDetector(
                 preCursorBandFrames++
                 val boundsChanged = preCursorBandLeft != prevLeft || preCursorBandRight != prevRight
                 if (wasEmpty || boundsChanged || preCursorBandFrames <= 3) {
-                    Log.d(TAG, "GREEN_PRECURSOR_BAND: band=${preCursorBandLeft}..${preCursorBandRight}, frames=${preCursorBandFrames}")
+                    dbg { "GREEN_PRECURSOR_BAND: band=${preCursorBandLeft}..${preCursorBandRight}, frames=${preCursorBandFrames}" }
                 }
             }
         } else if (lastAcceptedGreenWidth <= 0 && preCursorBandLeft >= 0) {
             preCursorBandLeft = -1
             preCursorBandRight = -1
             preCursorBandFrames = 0
-            Log.d(TAG, "GREEN_PRECURSOR_BAND_EXPIRED: reason=left_early_phase")
+            dbg { "GREEN_PRECURSOR_BAND_EXPIRED: reason=left_early_phase" }
         }
         val currentPreCursorBandSupported = hasOversizeSupportForBand(
             mergedSegments = mergedSegments,
@@ -197,7 +204,7 @@ class GreenZoneDetector(
         // --- Wide merged-zone diagnostic ---
         val widestOversized = mergedSegments.filter { it.width > 40 }.maxByOrNull { it.width }
         if (widestOversized != null) {
-            Log.d(TAG, "GREEN_WIDE_MERGED: seg=${widestOversized.left}..${widestOversized.right}(${widestOversized.width}), cursorX=$cursorX, earlyPhase=$earlyPhase")
+            dbg { "GREEN_WIDE_MERGED: seg=${widestOversized.left}..${widestOversized.right}(${widestOversized.width}), cursorX=$cursorX, earlyPhase=$earlyPhase" }
         }
 
         // --- Candidate selection from merged segments ---
@@ -235,11 +242,11 @@ class GreenZoneDetector(
             val desc = plausibleCandidates.joinToString(", ") { "${it.left}..${it.right}(${it.width})" }
             val ch = chosen?.let { "${it.left}..${it.right}(${it.width})" } ?: "none"
             val mode = if (lastAcceptedGreenWidth > 0) "cached" else "first_acquire"
-            Log.d(TAG, "GREEN_SELECT_RULE: mode=$mode, chosen=$ch, candidates=[$desc]")
+            dbg { "GREEN_SELECT_RULE: mode=$mode, chosen=$ch, candidates=[$desc]" }
         } else if (mergedSegments.size > 1) {
             val desc = mergedSegments.joinToString(", ") { "${it.left}..${it.right}(${it.width})" }
             val ch = chosen?.let { "${it.left}..${it.right}(${it.width})" } ?: "none"
-            Log.d(TAG, "GREEN_CANDIDATES: count=${mergedSegments.size}, chosen=$ch, candidates=[$desc]")
+            dbg { "GREEN_CANDIDATES: count=${mergedSegments.size}, chosen=$ch, candidates=[$desc]" }
         }
 
         val detectedGreenLeft = chosen?.left ?: -1
@@ -264,7 +271,7 @@ class GreenZoneDetector(
             val overlapPx = Math.min(detectedGreenRight, preCursorBandRight) -
                 Math.max(detectedGreenLeft, preCursorBandLeft) + 1
             if (overlapPx >= 6) {
-                Log.d(TAG, "GREEN_REJECT_PRECURSOR_OVERLAP: candidate=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}), band=${preCursorBandLeft}..${preCursorBandRight}, overlapPx=$overlapPx")
+                dbg { "GREEN_REJECT_PRECURSOR_OVERLAP: candidate=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}), band=${preCursorBandLeft}..${preCursorBandRight}, overlapPx=$overlapPx" }
                 true
             } else false
         }
@@ -290,9 +297,9 @@ class GreenZoneDetector(
                     lastAcceptedGreenWidth = pendingGreenWidth
                     greenGraceFrames = 0
                     oversizeFallbackFrames = 0
-                    Log.d(TAG, "GREEN_ACCEPTED: green=${pendingGreenLeft}..${pendingGreenRight}(${pendingGreenWidth}px)")
+                    dbg { "GREEN_ACCEPTED: green=${pendingGreenLeft}..${pendingGreenRight}(${pendingGreenWidth}px)" }
                 } else {
-                    Log.d(TAG, "GREEN_PENDING: raw=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}px), stableCount=${pendingGreenStableCount}")
+                    dbg { "GREEN_PENDING: raw=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}px), stableCount=${pendingGreenStableCount}" }
                 }
             } else {
                 // New or different candidate — start pending
@@ -300,7 +307,7 @@ class GreenZoneDetector(
                 pendingGreenRight = detectedGreenRight
                 pendingGreenWidth = detectedGreenWidth
                 pendingGreenStableCount = 1
-                Log.d(TAG, "GREEN_PENDING: raw=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}px), stableCount=1")
+                dbg { "GREEN_PENDING: raw=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}px), stableCount=1" }
             }
 
             // Only expose to ShotManager once promoted to accepted cache
@@ -324,7 +331,7 @@ class GreenZoneDetector(
                     greenGraceFrames = 0
                     acceptedGreenLeft = lastAcceptedGreenLeft
                     acceptedGreenRight = lastAcceptedGreenRight
-                    Log.d(TAG, "GREEN_FALLBACK_LAST_ACCEPTED: raw=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}px), cached=${lastAcceptedGreenLeft}..${lastAcceptedGreenRight}, reason=oversize, fallback=$oversizeFallbackFrames/$OVERSIZE_FALLBACK_LIMIT")
+                    dbg { "GREEN_FALLBACK_LAST_ACCEPTED: raw=${detectedGreenLeft}..${detectedGreenRight}(${detectedGreenWidth}px), cached=${lastAcceptedGreenLeft}..${lastAcceptedGreenRight}, reason=oversize, fallback=$oversizeFallbackFrames/$OVERSIZE_FALLBACK_LIMIT" }
                 } else {
                     // Reset pending — don't let a briefly narrow slice of this region promote later
                     pendingGreenLeft = -1
@@ -333,7 +340,7 @@ class GreenZoneDetector(
                     pendingGreenStableCount = 0
                     acceptedGreenLeft = -1
                     acceptedGreenRight = -1
-                    Log.d(TAG, "GREEN_REJECT_WIDTH: ${detectedGreenWidth}px [${detectedGreenLeft}..${detectedGreenRight}], no cached overlap")
+                    dbg { "GREEN_REJECT_WIDTH: ${detectedGreenWidth}px [${detectedGreenLeft}..${detectedGreenRight}], no cached overlap" }
                 }
             } else if (lastAcceptedGreenWidth > 0 && oversizeFallbackFrames >= OVERSIZE_FALLBACK_LIMIT) {
                 // Hard limit expired — invalidate accepted cache so it can't resurrect via grace
@@ -347,7 +354,7 @@ class GreenZoneDetector(
                 greenGraceFrames = 0
                 acceptedGreenLeft = -1
                 acceptedGreenRight = -1
-                Log.d(TAG, "GREEN_CACHE_INVALIDATED: reason=oversize_expired, fallback=$oversizeFallbackFrames")
+                dbg { "GREEN_CACHE_INVALIDATED: reason=oversize_expired, fallback=$oversizeFallbackFrames" }
             } else {
                 // No accepted cache at all
                 pendingGreenLeft = -1
@@ -356,7 +363,7 @@ class GreenZoneDetector(
                 pendingGreenStableCount = 0
                 acceptedGreenLeft = -1
                 acceptedGreenRight = -1
-                Log.d(TAG, "GREEN_REJECT_WIDTH: ${detectedGreenWidth}px [${detectedGreenLeft}..${detectedGreenRight}], no cache")
+                dbg { "GREEN_REJECT_WIDTH: ${detectedGreenWidth}px [${detectedGreenLeft}..${detectedGreenRight}], no cache" }
             }
         } else {
             // --- No green block found at all ---
@@ -365,31 +372,31 @@ class GreenZoneDetector(
                 greenGraceFrames++
                 acceptedGreenLeft = lastAcceptedGreenLeft
                 acceptedGreenRight = lastAcceptedGreenRight
-                Log.d(TAG, "GREEN_FALLBACK_LAST_ACCEPTED: grace=$greenGraceFrames/3, cached=${lastAcceptedGreenLeft}..${lastAcceptedGreenRight}, reason=grace")
+                dbg { "GREEN_FALLBACK_LAST_ACCEPTED: grace=$greenGraceFrames/3, cached=${lastAcceptedGreenLeft}..${lastAcceptedGreenRight}, reason=grace" }
             } else if (lastAcceptedGreenWidth > 0) {
                 acceptedGreenLeft = -1
                 acceptedGreenRight = -1
-                Log.d(TAG, "GREEN_FALLBACK_EXPIRED: reason=grace, grace=$greenGraceFrames")
+                dbg { "GREEN_FALLBACK_EXPIRED: reason=grace, grace=$greenGraceFrames" }
             } else {
                 acceptedGreenLeft = -1
                 acceptedGreenRight = -1
             }
         }
 
-        // --- Diagnostic multi-row scan (logging-only, does not affect detection) ---
-        val willReturnNoGreenWithCursor = cursorX >= 0 && acceptedGreenLeft < 0
-        val hasWideOnMain = mergedSegments.any { it.width > 40 }
-        if (earlyPhase || hasWideOnMain || willReturnNoGreenWithCursor) {
-            val row40 = (height * 40) / 100
-            val row50 = height / 2
-            val row60 = (height * 60) / 100
-            val s40 = scanRowGreenSegments(width, row40, getPixel)
-            val s50 = scanRowGreenSegments(width, row50, getPixel)
-            val s60 = scanRowGreenSegments(width, row60, getPixel)
-            fun fmt(segs: List<GreenSegment>): String =
-                if (segs.isEmpty()) "none"
-                else segs.joinToString(" ") { "${it.left}..${it.right}(${it.width})" }
-            Log.d(TAG, "GREEN_ROW_SCAN: cursorX=$cursorX, rows=[40: ${fmt(s40)} | 50: ${fmt(s50)} | 60: ${fmt(s60)}]")
+        // --- Orange-band fallback ---
+        // No green zone this frame but a cursor (meter) is present: fall back to the
+        // wider orange band center so ShotManager still has a target on hard shots.
+        if (acceptedGreenLeft < 0 && cursorX >= 0) {
+            val band = scanOrangeBand(width, midY, getPixel)
+            if (band != null) {
+                dbg { "ORANGE_FALLBACK: band=${band.left}..${band.right}(${band.width}px), cursorX=$cursorX" }
+                return BarAnalysis(
+                    cursorX = cursorX,
+                    greenLeft = band.left,
+                    greenRight = band.right,
+                    isOrangeFallback = true
+                )
+            }
         }
 
         return BarAnalysis(
@@ -400,44 +407,53 @@ class GreenZoneDetector(
     }
 
     /**
-     * Diagnostic: collect contiguous green segments on an arbitrary row using
-     * the same green criteria as the main scan. Does not affect detection.
+     * Orange-band fallback (port of pcshooter analyze_row): widest contiguous colored
+     * run (green OR orange) on row y, bridging small gaps. Green sits between orange
+     * flanks so the band is contiguous. Stateless — used only when the green pipeline
+     * found nothing. Returns null if no plausibly-sized band exists.
      */
-    private fun scanRowGreenSegments(width: Int, y: Int, getPixel: (Int, Int) -> Int): List<GreenSegment> {
-        val segments = mutableListOf<GreenSegment>()
-        var inGreen = false
-        var currentGreenStart = -1
+    private fun scanOrangeBand(width: Int, y: Int, getPixel: (Int, Int) -> Int): GreenSegment? {
+        val loX = (width * 0.05).toInt()
+        val hiX = (width * 0.95).toInt()
+        var inRun = false
+        var runStart = -1
+        var lastColored = -1
+        var bestLeft = -1
+        var bestRight = -1
+        fun closeAt(end: Int) {
+            val w = end - runStart
+            if (w in ORANGE_MIN_RUN..ORANGE_MAX_RUN && w > bestRight - bestLeft) {
+                bestLeft = runStart
+                bestRight = end
+            }
+        }
         for (x in 0 until width) {
             val p = getPixel(x, y)
             val r = (p shr 16) and 0xFF
             val g = (p shr 8) and 0xFF
             val b = p and 0xFF
-            val isGreen = isGreenPixel(p) || isGreenish(r, g, b)
-            if (isGreen && x > width * 0.05 && x < width * 0.95) {
-                if (!inGreen) {
-                    currentGreenStart = x
-                    inGreen = true
+            val colored = x in loX until hiX &&
+                (isGreenPixel(p) || isGreenish(r, g, b) || isOrangeish(r, g, b))
+            if (colored) {
+                if (!inRun) {
+                    runStart = x
+                    inRun = true
                 }
-            } else {
-                if (inGreen) {
-                    val segRight = x - 1
-                    val segWidth = segRight - currentGreenStart
-                    if (segWidth > 0) {
-                        segments.add(GreenSegment(currentGreenStart, segRight, segWidth, (currentGreenStart + segRight) / 2))
-                    }
-                    inGreen = false
-                }
+                lastColored = x
+            } else if (inRun && x - lastColored > ORANGE_MAX_GAP) {
+                closeAt(lastColored)
+                inRun = false
             }
         }
-        if (inGreen) {
-            val segRight = width - 1
-            val segWidth = segRight - currentGreenStart
-            if (segWidth > 0) {
-                segments.add(GreenSegment(currentGreenStart, segRight, segWidth, (currentGreenStart + segRight) / 2))
-            }
-        }
-        return mergeNearbySegments(segments, maxGapPx = 4)
+        if (inRun) closeAt(lastColored)
+        return if (bestLeft >= 0)
+            GreenSegment(bestLeft, bestRight, bestRight - bestLeft, (bestLeft + bestRight) / 2)
+        else null
     }
+
+    /** In-game meter orange segment, e.g. RGB(229,112,40). Mirrors pcshooter orangeish. */
+    private fun isOrangeish(r: Int, g: Int, b: Int): Boolean =
+        r >= 100 && r > g + 25 && r > b + 45 && g >= 40
 
     private fun hasOversizeSupportForBand(
         mergedSegments: List<GreenSegment>,
@@ -565,29 +581,7 @@ class GreenZoneDetector(
         return foundGreen
     }
 
-    /** Save frame as debug PNG — no text dump to keep logs clean */
-    private fun saveDebugPng(width: Int, height: Int, getPixel: (Int, Int) -> Int, index: Int) {
-        try {
-            val dir = java.io.File(debugDir!!)
-            if (!dir.exists()) dir.mkdirs()
-            val file = java.io.File(dir, "bar_frame_${String.format("%02d", index)}.png")
-            val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
-            for (x in 0 until width) {
-                for (y in 0 until height) {
-                    bitmap.setPixel(x, y, getPixel(x, y))
-                }
-            }
-            file.outputStream().use { fos ->
-                bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
-            }
-            Log.d(TAG, "Debug frame saved: bar_frame_${String.format("%02d", index)}.png (${width}x${height})")
-        } catch (e: Exception) {
-            Log.e(TAG, "saveDebugPng failed: ${e.message}")
-        }
-    }
-
     fun resetDebug() {
-        frameDumpCount = 0
         pendingGreenLeft = -1
         pendingGreenRight = -1
         pendingGreenWidth = 0
@@ -601,30 +595,10 @@ class GreenZoneDetector(
         preCursorBandRight = -1
         preCursorBandFrames = 0
     }
-    fun saveReleaseFrame(width: Int, height: Int, getPixel: (Int, Int) -> Int, cursorX: Int, targetX: Int) {
-        if (debugDir == null) return
-        try {
-            val dir = java.io.File(debugDir)
-            if (!dir.exists()) dir.mkdirs()
-            val ts = System.currentTimeMillis()
-            val file = java.io.File(dir, "release_$ts.png")
-            val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
-            for (x in 0 until width) {
-                for (y in 0 until height) {
-                    bitmap.setPixel(x, y, getPixel(x, y))
-                }
-            }
-            file.outputStream().use { fos ->
-                bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
-            }
-            Log.d(TAG, "Release frame: cursor=$cursorX, target=$targetX → saved release_$ts.png")
-        } catch (e: Exception) {
-            Log.e(TAG, "saveReleaseFrame failed: ${e.message}")
-        }
-    }
 }
 
 private const val TAG = "HoopLandHelper"
+private const val DEBUG = false   // per-frame detection logging (power); on only for diagnosis
 
 private fun defaultIsGreen(pixel: Int, greenHsv: HsvRange): Boolean {
     val hsv = FloatArray(3)

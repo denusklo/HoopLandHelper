@@ -49,6 +49,11 @@ MAX_HOLD_S = 1.6        # never hold past this: over-holding keeps the ball in h
                         # (and fouls in real games) — better a bad shot than no shot
 CURSOR_MIN_BRIGHTNESS = 600   # of 765, from GreenZoneDetector.kt
 GREEN_MIN_RUN, GREEN_MAX_RUN, GREEN_MAX_GAP = 8, 60, 4
+# Hard/contested shots show an orange-only meter (no green sweet-spot). Aim its
+# center instead — ~3x wider, far more forgiving. The band is orange+green+orange,
+# so bridge the green-sized gap; 200 rejects full-width court-floor bleed on the
+# 463px bar. ponytail: bump ORANGE_MAX_RUN only if a real orange band exceeds it.
+ORANGE_MIN_RUN, ORANGE_MAX_RUN, ORANGE_MAX_GAP = 16, 200, 40
 MAX_STEP_PX = 35        # cursor moves ~10-20px/frame; bigger jump = detection glitch
 SPEED_BOUNDS = (0.15, 0.65)  # px/ms plausibility gate (observed true speed ~0.42-0.50)
 FIT_MAX_RESIDUAL_PX = 8.0    # reject a fit containing a brightness-argmax jump
@@ -99,24 +104,33 @@ def analyze_row(row):
     if not meter_present:
         return None, None
 
+    if zone is None:
+        # No green sweet-spot: fall back to the wider orange band as the target
+        # zone. Downstream (stable_zone, target = zone center, success check) is
+        # zone-agnostic, so aiming shifts to the band center automatically.
+        orange = orangeish.copy()
+        orange[: int(0.05 * w)] = False
+        orange[int(0.95 * w):] = False
+        zone = best_run(orange, ORANGE_MIN_RUN, ORANGE_MAX_RUN, ORANGE_MAX_GAP)
+
     cx = int(np.argmax(bright))
     cursor = cx if bright[cx] > CURSOR_MIN_BRIGHTNESS else None
     return cursor, zone
 
 
-def best_run(mask):
-    """Widest run of True, merging gaps <= GREEN_MAX_GAP, width GREEN_MIN_RUN..GREEN_MAX_RUN."""
+def best_run(mask, min_run=GREEN_MIN_RUN, max_run=GREEN_MAX_RUN, max_gap=GREEN_MAX_GAP):
+    """Widest run of True, merging gaps <= max_gap, width min_run..max_run."""
     idx = np.flatnonzero(mask)
     if len(idx) == 0:
         return None
     runs, start, prev = [], idx[0], idx[0]
     for i in idx[1:]:
-        if i - prev > GREEN_MAX_GAP + 1:
+        if i - prev > max_gap + 1:
             runs.append((start, prev))
             start = i
         prev = i
     runs.append((start, prev))
-    runs = [(a, b) for a, b in runs if GREEN_MIN_RUN <= b - a + 1 <= GREEN_MAX_RUN]
+    runs = [(a, b) for a, b in runs if min_run <= b - a + 1 <= max_run]
     if not runs:
         return None
     return max(runs, key=lambda ab: ab[1] - ab[0])

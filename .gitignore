@@ -21,6 +21,10 @@ captures/
 # Kotlin
 *.class
 
+# Bundled frida-inject binary (~53MB) — fetch via scripts/fetch-frida-inject.sh, not committed.
+# agent_play.js in the same dir IS committed (it's source).
+app/src/main/assets/frida/frida-inject
+
 # Credentials
 google-services.json
 
@@ -29,9 +33,9 @@ CLAUDE.md
 *.log
 .codex
 
-# Local harness notes and backups
+# Local harness notes and generated/reference artifacts
 docs/harness/
-CLAUDE.md.bak
+artifacts/
 
 # Python development artifacts
 pcshooter/.venv/
