@@ -15,8 +15,10 @@ const CFG = Object.assign({
   powerForce: 0.45,
   freeze: false,      // cosmetic: park the visual cursor on green
   teamFilter: true,   // only your player (false = everyone, debug)
+  aimTeam: false,     // aim-assist gate: false = controlled avatar (isPlayer); true = whole team (ourSet, isPlayer-locked)
 }, (typeof globalThis !== 'undefined' && globalThis.HOOK_CFG) || {});
 const STRENGTH = CFG.strength, POWER_FORCE = CFG.powerForce, TEAM_FILTER = CFG.teamFilter;
+const AIM_TEAM = CFG.aimTeam;
 
 const ISPLAYER_OFF = 0x130, POWER_OFF = 0xD8, HANDLE_OFF = 0x98, ARR_FIRST = 0x20, GREEN_OFF = 0x20;
 
@@ -27,6 +29,8 @@ function main() {
   const asm_get_image = ex('il2cpp_assembly_get_image', 'pointer', ['pointer']);
   const class_from_name = ex('il2cpp_class_from_name', 'pointer', ['pointer', 'pointer', 'pointer']);
   const method_from_name = ex('il2cpp_class_get_method_from_name', 'pointer', ['pointer', 'pointer', 'int']);
+  const class_get_type = ex('il2cpp_class_get_type', 'pointer', ['pointer']);
+  const type_get_object = ex('il2cpp_type_get_object', 'pointer', ['pointer']);
 
   const domain = domain_get();
   thread_attach(domain);
@@ -54,7 +58,93 @@ function main() {
   const mInv = T('InverseTransformPoint', 1);
   const invPt = new NativeFunction(mInv.readPointer(), ['float', 'float', 'float'], ['pointer', ['float', 'float', 'float'], 'pointer']);
 
-  const isUser = (pc) => !TEAM_FILTER || (!pc.isNull() && pc.add(ISPLAYER_OFF).readU8() !== 0);
+  // ---- optional whole-team roster (only built when aimTeam) ----
+  // Our team = the team of the controlled avatar (isPlayer). Auto-detected and locked for the match;
+  // a new match (new TeamManager objects) re-locks. Adapted from agent_autoplay.js refreshOurTeam.
+  const PS = Process.pointerSize;
+  const ObjectC = resolveNs('UnityEngine', 'Object');
+  const PlayerManager = resolveNs('', 'PlayerManager');
+  const mFind = method_from_name(ObjectC, Memory.allocUtf8String('FindObjectOfType'), 2);
+  const findObjectOfType = new NativeFunction(mFind.readPointer(), 'pointer', ['pointer', 'int', 'pointer']);
+  const pmType = type_get_object(class_get_type(PlayerManager));
+  // Do NOT cache PlayerManager: a new match reloads the scene and destroys it (dead pointer isn't null).
+  const getPM = () => { try { return findObjectOfType(pmType, 0, mFind); } catch (e) { return NULL; } };
+  const readList = (mgr, off) => {
+    try {
+      if (!mgr || mgr.isNull()) return [];
+      const lst = mgr.add(off).readPointer(); if (lst.isNull()) return [];
+      const arr = lst.add(0x10).readPointer(); const size = lst.add(0x18).readS32();
+      if (arr.isNull() || size <= 0 || size > 32) return [];
+      const out = []; for (let i = 0; i < size; i++) { const p = arr.add(0x20 + i * PS).readPointer(); if (!p.isNull()) out.push(p); } return out;
+    } catch (e) { return []; }
+  };
+  const teamOf = (pc) => { try { return (!pc || pc.isNull()) ? NULL : pc.add(0x38).readPointer(); } catch (e) { return NULL; } };
+  let ourSet = new Set(), ourTeamMgr = null, lastSide = 'x';
+  // Side-file write via libc: under an eternalized QuickJS agent (frida-inject -e) the Frida `File`
+  // API is unreliable, and the agent runs as the game uid, so it writes the (chmod 666) file directly.
+  const libc = Process.getModuleByName('libc.so');
+  const fopen = new NativeFunction(libc.getExportByName('fopen'), 'pointer', ['pointer', 'pointer']);
+  const fwrite = new NativeFunction(libc.getExportByName('fwrite'), 'ulong', ['pointer', 'ulong', 'ulong', 'pointer']);
+  const fclose = new NativeFunction(libc.getExportByName('fclose'), 'int', ['pointer']);
+  const fread = new NativeFunction(libc.getExportByName('fread'), 'ulong', ['pointer', 'ulong', 'ulong', 'pointer']);
+  const TEAM_PATH = Memory.allocUtf8String('/data/local/tmp/.hoop_team');
+  const MODE_W = Memory.allocUtf8String('w');
+  // Live aim-mode toggle: the app writes 'team'/'player' to this file; the eternalized agent re-reads
+  // it (no re-inject needed) so isUser can switch between whole-team and controlled-avatar at runtime.
+  const AIMMODE_PATH = Memory.allocUtf8String('/data/local/tmp/.hoop_aimmode');
+  const MODE_R = Memory.allocUtf8String('r');
+  let aimTeamLive = AIM_TEAM;
+  const readAimMode = () => {
+    try {
+      const f = fopen(AIMMODE_PATH, MODE_R);
+      if (f.isNull()) return;
+      const buf = Memory.alloc(16);
+      const n = fread(buf, 1, 15, f).toNumber();
+      fclose(f);
+      if (n > 0) aimTeamLive = buf.readUtf8String(n).indexOf('team') === 0;
+    } catch (e) {}
+  };
+  // Publish the detected side (home/road/null) to a side file the app polls, and send it. Change-only.
+  const writeSide = (side) => {
+    if (side === lastSide) return;
+    lastSide = side;
+    try {
+      const f = fopen(TEAM_PATH, MODE_W);
+      if (!f.isNull()) {
+        // non-empty marker even when unlocked: a written 'detecting' proves refreshOurTeam ran (vs an
+        // empty pre-created file = detection never ran). App maps anything != home/road to detecting.
+        const s = (side === 'home' || side === 'road') ? side : 'detecting';
+        fwrite(Memory.allocUtf8String(s), 1, s.length, f);
+        fclose(f);
+      }
+    } catch (e) {}
+    send({ t: 'team', side });
+  };
+  // Detection runs ALWAYS (so the UI can show the side in either mode); the AIM gate uses ourSet only
+  // when AIM_TEAM. null side => "detecting" (no controlled avatar locked yet / cold sim / between matches).
+  const refreshOurTeam = () => {
+    try {
+      const mgr = getPM(); if (mgr.isNull()) { writeSide(null); return; }
+      const home = readList(mgr, 0x88), road = readList(mgr, 0x90);
+      const all = home.concat(road);
+      if (all.length === 0) { writeSide(null); return; }
+      for (const pc of all) { if (!pc.isNull() && pc.add(ISPLAYER_OFF).readU8() !== 0) { ourTeamMgr = teamOf(pc); break; } }
+      if (ourTeamMgr && !all.some((pc) => teamOf(pc).equals(ourTeamMgr))) ourTeamMgr = null; // stale (new match)
+      if (!ourTeamMgr) { writeSide(null); return; }   // no controlled avatar seen yet -> cannot auto-detect (cold sim)
+      ourSet = new Set(all.filter((pc) => teamOf(pc).equals(ourTeamMgr)).map((pc) => pc.toString()));
+      const side = home.some((pc) => teamOf(pc).equals(ourTeamMgr)) ? 'home'
+                 : road.some((pc) => teamOf(pc).equals(ourTeamMgr)) ? 'road' : null;
+      writeSide(side);
+    } catch (e) {}
+  };
+  setInterval(() => { refreshOurTeam(); readAimMode(); }, 500);   // timer-driven (survives eternalize); no per-frame cost
+
+  const isUser = (pc) => {
+    if (!TEAM_FILTER) return true;                              // debug: everyone
+    if (pc.isNull()) return false;
+    if (aimTeamLive) return ourSet.has(pc.toString());          // our whole team (isPlayer-locked); live-toggled
+    return pc.add(ISPLAYER_OFF).readU8() !== 0;                 // controlled avatar only
+  };
 
   // ---- aim-assist (arg0 = shooting PlayerController) ----
   if (CFG.aim) {
@@ -91,6 +181,8 @@ function main() {
     });
   }
 
+  // Freeze cursor-move is opt-in: attach the per-frame Update hook ONLY when freeze is on, so normal
+  // play pays no per-frame JS cost. Team/aim detection is timer-driven (setInterval above).
   if (CFG.freeze) {
     const handle = (inst) => {
       const arr = inst.add(HANDLE_OFF).readPointer();
@@ -115,9 +207,11 @@ function main() {
     });
   }
 
+  readAimMode(); refreshOurTeam();   // immediate first read/attempt at load (before eternalize)
   send({ t: 'ready', msg: 'PLAY ON — aim=' + (CFG.aim ? STRENGTH : 'off') +
     ' power=' + (CFG.power ? POWER_FORCE : 'off') + ' freeze=' + (CFG.freeze ? 'on' : 'off') +
-    ' team-filter=' + (TEAM_FILTER ? 'your player only' : 'EVERYONE') });
+    ' team-filter=' + (TEAM_FILTER ? (AIM_TEAM ? 'whole team (isPlayer-locked)' : 'your player only') : 'EVERYONE') +
+    ' aimTeam=' + (AIM_TEAM ? 'on' : 'off') });
 }
 
 setTimeout(() => { try { main(); } catch (e) { send({ t: 'error', msg: '' + e, stack: e.stack }); } }, 300);

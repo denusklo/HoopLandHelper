@@ -9,7 +9,9 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.*
@@ -50,6 +52,13 @@ class OverlayService : Service() {
     private var initialX = 0; private var initialY = 0
     private var initialTouchX = 0f; private var initialTouchY = 0f
     private var isDragging = false
+
+    // Detected-team label doubles as the manual attach control (tap to attach)
+    private var teamLabel: TextView? = null
+    private var aimLabel: TextView? = null   // tap-to-toggle: AIM PLAYER <-> AIM TEAM
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var labelState = "off"          // off | attaching | attached | detached
+    private var labelSide: String? = null   // home | road | null
 
     // Bar rectangle overlay
     private var barRectView: View? = null
@@ -173,13 +182,89 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 100 }
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 240 }
 
         overlayView?.setOnTouchListener { _, event -> handleAutoTouch(event, params) }
         windowManager.addView(overlayView, params)
 
+        showTeamLabel(params.y)
+
         // Show bar rectangle guide after a short delay (if enabled)
         overlayView?.postDelayed({ showBarRectOverlay() }, 500)
+    }
+
+    // Tap-to-attach label above the AUTO button. Shows TAP TO ATTACH / detecting… / HOME / ROAD.
+    private fun showTeamLabel(autoBtnY: Int) {
+        val label = TextView(this).apply {
+            setBackgroundColor(0xCC000000.toInt())
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setPadding(12, 4, 12, 4)
+            setOnClickListener {
+                // Only arming from a resting state; while attaching/attached the tap is a no-op.
+                if (labelState == "off" || labelState == "detached") {
+                    fridaAimAssist.arm()
+                    labelState = "attaching"; labelSide = null
+                    renderTeamLabel()
+                }
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = (autoBtnY - 100).coerceAtLeast(0) }
+        windowManager.addView(label, params)
+        teamLabel = label
+        labelSide = fridaAimAssist.detectedSide
+        renderTeamLabel()
+        fridaAimAssist.onTeam = { side -> uiHandler.post { labelSide = side; renderTeamLabel() } }
+        fridaAimAssist.onState = { state -> uiHandler.post { labelState = state; renderTeamLabel() } }
+
+        // Aim-mode toggle, just below the team label. Live: writes the mode file the agent re-reads.
+        val aim = TextView(this).apply {
+            setBackgroundColor(0xCC000000.toInt())
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setPadding(12, 4, 12, 4)
+            setOnClickListener { fridaAimAssist.setAimMode(!fridaAimAssist.aimTeam) }
+        }
+        val aimParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = (autoBtnY - 56).coerceAtLeast(0) }
+        windowManager.addView(aim, aimParams)
+        aimLabel = aim
+        renderAimLabel()
+        fridaAimAssist.onAimMode = { uiHandler.post { renderAimLabel() } }
+    }
+
+    private fun renderTeamLabel() {
+        teamLabel?.text = when {
+            labelState == "off" || labelState == "detached" -> "TAP TO ATTACH"
+            labelSide == "home" -> "HOME"
+            labelSide == "road" -> "ROAD"
+            else -> "detecting…"
+        }
+    }
+
+    private fun renderAimLabel() {
+        aimLabel?.text = if (fridaAimAssist.aimTeam) "AIM: TEAM" else "AIM: PLAYER"
+    }
+
+    private fun removeTeamLabel() {
+        fridaAimAssist.onTeam = null
+        fridaAimAssist.onState = null
+        fridaAimAssist.onAimMode = null
+        teamLabel?.let { windowManager.removeView(it) }
+        teamLabel = null
+        aimLabel?.let { windowManager.removeView(it) }
+        aimLabel = null
     }
 
     private fun handleAutoTouch(event: MotionEvent, params: WindowManager.LayoutParams): Boolean {
@@ -221,6 +306,7 @@ class OverlayService : Service() {
 
     private fun removeAutoButton() {
         removeBarRectOverlay()
+        removeTeamLabel()
         overlayView?.let { windowManager.removeView(it) }
         overlayView = null
         btnAuto = null
@@ -602,6 +688,7 @@ class OverlayService : Service() {
         fridaAimAssist.stop()
         screenCapture.stop()
         removeBarRectOverlay()
+        removeTeamLabel()
         overlayView?.let { windowManager.removeView(it) }
         calView?.let { windowManager.removeView(it) }
         super.onDestroy()

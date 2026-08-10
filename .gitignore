@@ -34,7 +34,8 @@ CLAUDE.md
 .codex
 
 # Local harness notes and generated/reference artifacts
-docs/harness/
+# (docs/harness is a symlink -> gamehook/harness, versioned in the private hoopland-gamehook repo)
+docs/harness
 artifacts/
 
 # Python development artifacts
